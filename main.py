@@ -5,7 +5,7 @@ Bot entry point. Responsible only for:
   - Environment loading
   - Discord client creation
   - Database initialization
-  - Event registration (on_ready)
+  - Event registration (on_ready, on_guild_join)
   - Slash command registration
   - Background task startup
   - Launching the bot
@@ -48,7 +48,24 @@ async def on_ready():
     await tm.startup_integrity_check()
     bot.loop.create_task(tm.session_cleanup_loop())
     bot.loop.create_task(tm.db_maintenance_loop())
+    bot.loop.create_task(tm.scheduled_timer_loop())
     print("✅ Ready.")
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """Immediately leave any guild not in the whitelist."""
+    if not tm.is_guild_allowed(guild.id):
+        await tm.audit_log(
+            action="GUILD JOIN — UNAUTHORIZED — LEAVING",
+            result="blocked",
+            detail=f"guild={guild.name}  id={guild.id}",
+        )
+        print(f"[Security] Left unauthorized guild: {guild.name} ({guild.id})")
+        try:
+            await guild.leave()
+        except Exception as e:
+            print(f"[Security] Failed to leave guild {guild.id}: {e}")
 
 
 # ── Run ───────────────────────────────────────────────────────────────
