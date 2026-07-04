@@ -50,6 +50,20 @@ DB_PATH               = "bot.db"
 MAX_YEARS_AHEAD       = 10
 SESSION_TIMEOUT_SECS  = 15 * 60   # 15 minutes of inactivity
 
+# ── Guild whitelist ───────────────────────────────────────────────────
+# Only guilds in this set may use the bot. Any other guild triggers an
+# immediate leave. Add your authorized guild IDs here.
+ALLOWED_GUILDS: set[int] = {
+    1485974710847013014,   # replace with actual guild IDs
+    1428800178848010331,
+}
+
+
+def is_guild_allowed(guild_id: int) -> bool:
+    """Single authoritative check for guild whitelist."""
+    return guild_id in ALLOWED_GUILDS
+
+
 # Bot reference — set by main.py via set_bot()
 _bot: discord.Bot | None = None
 
@@ -418,13 +432,14 @@ async def init_db() -> None:
         db = await _get_db()
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS timers (
-                channel_id  TEXT PRIMARY KEY,
-                name        TEXT NOT NULL,
-                end_time    TEXT NOT NULL,
-                warned      INTEGER NOT NULL DEFAULT 0,
-                no_delete   INTEGER NOT NULL DEFAULT 0,
-                ended       INTEGER NOT NULL DEFAULT 0,
-                last_check  TEXT
+                channel_id   TEXT PRIMARY KEY,
+                name         TEXT NOT NULL,
+                end_time     TEXT NOT NULL,
+                warned_1h    INTEGER NOT NULL DEFAULT 0,
+                warned_12h   INTEGER NOT NULL DEFAULT 0,
+                no_delete    INTEGER NOT NULL DEFAULT 0,
+                ended        INTEGER NOT NULL DEFAULT 0,
+                last_check   TEXT
             );
             CREATE TABLE IF NOT EXISTS tournament_channels (
                 channel_id  TEXT PRIMARY KEY,
@@ -435,13 +450,49 @@ async def init_db() -> None:
                 skip_next   INTEGER NOT NULL DEFAULT 0
             );
             INSERT OR IGNORE INTO tournament_settings (id, skip_next) VALUES (1, 0);
+
+            -- Deferred operations (Update / Extend / Delete queued for on-expiry execution)
+            CREATE TABLE IF NOT EXISTS deferred_ops (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id   TEXT NOT NULL,
+                op_type      TEXT NOT NULL,   -- 'update' | 'extend' | 'delete'
+                payload      TEXT NOT NULL,   -- JSON-encoded op data
+                created_at   TEXT NOT NULL,
+                FOREIGN KEY (channel_id) REFERENCES timers(channel_id) ON DELETE CASCADE
+            );
+
+            -- Scheduled timer creation jobs
+            CREATE TABLE IF NOT EXISTS scheduled_timers (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id        TEXT NOT NULL,
+                name            TEXT NOT NULL,
+                create_at       TEXT NOT NULL,   -- UTC ISO, when to create the channel
+                end_time        TEXT NOT NULL,   -- UTC ISO, the timer's actual expiry
+                executed        INTEGER NOT NULL DEFAULT 0,
+                created_at_row  TEXT NOT NULL
+            );
         """)
+
+        # ── Safe column migrations for existing databases ────────────────
+        migrations = [
+            ("timers",  "ended",      "INTEGER NOT NULL DEFAULT 0"),
+            ("timers",  "warned_1h",  "INTEGER NOT NULL DEFAULT 0"),
+            ("timers",  "warned_12h", "INTEGER NOT NULL DEFAULT 0"),
+        ]
+        for table, col, typedef in migrations:
+            try:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
+            except Exception:
+                pass   # column already exists
+
+        # Migrate old `warned` → `warned_1h` (copy data, keep old column harmlessly)
         try:
             await db.execute(
-                "ALTER TABLE timers ADD COLUMN ended INTEGER NOT NULL DEFAULT 0"
+                "UPDATE timers SET warned_1h = warned WHERE warned_1h = 0 AND warned = 1"
             )
         except Exception:
-            pass   # column already exists
+            pass
+
         await db.commit()
 
 
@@ -457,18 +508,22 @@ async def db_all_timers() -> list:
 
 async def db_upsert_timer(
     channel_id: str, name: str, end_time: str,
-    warned: bool = False, no_delete: bool = False,
-    ended: bool = False, last_check: str | None = None,
+    warned_1h: bool = False, warned_12h: bool = False,
+    no_delete: bool = False, ended: bool = False,
+    last_check: str | None = None,
 ) -> None:
     try:
         await _db_exec("""
-            INSERT INTO timers (channel_id, name, end_time, warned, no_delete, ended, last_check)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO timers
+                (channel_id, name, end_time, warned_1h, warned_12h, no_delete, ended, last_check)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(channel_id) DO UPDATE SET
                 name=excluded.name, end_time=excluded.end_time,
-                warned=excluded.warned, no_delete=excluded.no_delete,
-                ended=excluded.ended, last_check=excluded.last_check
-        """, (channel_id, name, end_time, int(warned), int(no_delete), int(ended), last_check))
+                warned_1h=excluded.warned_1h, warned_12h=excluded.warned_12h,
+                no_delete=excluded.no_delete, ended=excluded.ended,
+                last_check=excluded.last_check
+        """, (channel_id, name, end_time,
+              int(warned_1h), int(warned_12h), int(no_delete), int(ended), last_check))
     except DBDiskFullError as e:
         await _handle_db_disk_full("db_upsert_timer", e, f"name={name}")
         raise
@@ -478,7 +533,7 @@ async def db_upsert_timer(
 
 
 async def db_update_timer_field(channel_id: str, **kwargs) -> None:
-    allowed  = {"name", "end_time", "warned", "no_delete", "ended", "last_check"}
+    allowed  = {"name", "end_time", "warned_1h", "warned_12h", "no_delete", "ended", "last_check"}
     filtered = {k: v for k, v in kwargs.items() if k in allowed}
     if not filtered:
         return
@@ -551,6 +606,112 @@ async def db_set_skip_next(value: bool) -> None:
         raise
     except DBError as e:
         await log_error("db_set_skip_next", e)
+        raise
+
+
+# ── Deferred operations CRUD ──────────────────────────────────────────
+# op_type values: 'update' | 'extend' | 'delete'
+# payload is JSON-encoded per-op data:
+#   update:  {"name": str, "end_time": ISO str}
+#   extend:  {"delta_seconds": int}
+#   delete:  {}
+
+import json as _json
+
+
+async def db_add_deferred_op(channel_id: str, op_type: str, payload: dict) -> None:
+    try:
+        await _db_exec(
+            "INSERT INTO deferred_ops (channel_id, op_type, payload, created_at) VALUES (?, ?, ?, ?)",
+            (channel_id, op_type, _json.dumps(payload),
+             datetime.now(timezone.utc).isoformat()),
+        )
+    except DBDiskFullError as e:
+        await _handle_db_disk_full("db_add_deferred_op", e, f"op={op_type}")
+        raise
+    except DBError as e:
+        await log_error("db_add_deferred_op", e)
+        raise
+
+
+async def db_get_deferred_ops(channel_id: str) -> list:
+    return await _db_all(
+        "SELECT * FROM deferred_ops WHERE channel_id = ? ORDER BY id ASC",
+        (channel_id,),
+    )
+
+
+async def db_delete_deferred_ops(channel_id: str) -> None:
+    """Delete all pending ops for a timer (e.g. when timer is deleted)."""
+    try:
+        await _db_exec("DELETE FROM deferred_ops WHERE channel_id = ?", (channel_id,))
+    except DBDiskFullError as e:
+        await _handle_db_disk_full("db_delete_deferred_ops", e, channel_id)
+        raise
+    except DBError as e:
+        await log_error("db_delete_deferred_ops", e)
+        raise
+
+
+async def db_delete_deferred_op(op_id: int) -> None:
+    try:
+        await _db_exec("DELETE FROM deferred_ops WHERE id = ?", (op_id,))
+    except DBDiskFullError as e:
+        await _handle_db_disk_full("db_delete_deferred_op", e, f"id={op_id}")
+        raise
+    except DBError as e:
+        await log_error("db_delete_deferred_op", e)
+        raise
+
+
+# ── Scheduled timers CRUD ─────────────────────────────────────────────
+
+async def db_add_scheduled_timer(
+    guild_id: int, name: str, create_at: str, end_time: str
+) -> None:
+    try:
+        await _db_exec(
+            """INSERT INTO scheduled_timers
+               (guild_id, name, create_at, end_time, executed, created_at_row)
+               VALUES (?, ?, ?, ?, 0, ?)""",
+            (str(guild_id), name, create_at, end_time,
+             datetime.now(timezone.utc).isoformat()),
+        )
+    except DBDiskFullError as e:
+        await _handle_db_disk_full("db_add_scheduled_timer", e, f"name={name}")
+        raise
+    except DBError as e:
+        await log_error("db_add_scheduled_timer", e)
+        raise
+
+
+async def db_all_scheduled_timers() -> list:
+    return await _db_all(
+        "SELECT * FROM scheduled_timers WHERE executed = 0 ORDER BY create_at ASC"
+    )
+
+
+async def db_mark_scheduled_executed(row_id: int) -> None:
+    try:
+        await _db_exec(
+            "UPDATE scheduled_timers SET executed = 1 WHERE id = ?", (row_id,)
+        )
+    except DBDiskFullError as e:
+        await _handle_db_disk_full("db_mark_scheduled_executed", e, f"id={row_id}")
+        raise
+    except DBError as e:
+        await log_error("db_mark_scheduled_executed", e)
+        raise
+
+
+async def db_delete_scheduled_timer(row_id: int) -> None:
+    try:
+        await _db_exec("DELETE FROM scheduled_timers WHERE id = ?", (row_id,))
+    except DBDiskFullError as e:
+        await _handle_db_disk_full("db_delete_scheduled_timer", e, f"id={row_id}")
+        raise
+    except DBError as e:
+        await log_error("db_delete_scheduled_timer", e)
         raise
 
 
@@ -902,6 +1063,11 @@ async def cleanup_timer(channel_id: str, reason: str = "unknown", guild=None) ->
     task = TIMER_TASKS.pop(channel_id, None)
     if task and not task.done():
         task.cancel()
+    # deferred_ops cascade-deletes via FK, but call explicitly to be safe
+    try:
+        await db_delete_deferred_ops(channel_id)
+    except Exception:
+        pass
     await db_delete_timer(channel_id)
     stale = [k for k, v in list(CURRENT_SELECTION.items()) if v == channel_id]
     for k in stale:
@@ -926,6 +1092,79 @@ async def cleanup_timer(channel_id: str, reason: str = "unknown", guild=None) ->
 TIMER_TASKS: dict[str, asyncio.Task] = {}
 
 
+async def _execute_deferred_ops(channel_id: str, channel, guild) -> None:
+    """
+    Execute all pending deferred operations for a timer at expiry.
+    Operations run in insertion order. Each failure is logged but does not
+    stop subsequent ops.
+    """
+    ops = await db_get_deferred_ops(channel_id)
+    if not ops:
+        return
+
+    for op in ops:
+        try:
+            op_type = op["op_type"]
+            payload = _json.loads(op["payload"])
+
+            if op_type == "delete":
+                # Already handled in expiry flow — just mark consumed
+                pass
+
+            elif op_type == "update":
+                new_name     = payload.get("name", "")
+                new_end_iso  = payload.get("end_time", "")
+                if new_name and new_end_iso:
+                    new_end = datetime.fromisoformat(new_end_iso)
+                    await db_update_timer_field(
+                        channel_id, name=new_name, end_time=new_end_iso,
+                        warned_1h=False, warned_12h=False,
+                    )
+                    if channel:
+                        await safe_channel_edit(
+                            channel, name=format_timer_channel_name(new_name, new_end)
+                        )
+                    await audit_log(
+                        action="DEFERRED UPDATE — EXECUTED", guild=guild,
+                        detail=f"name={new_name}  new_end=<t:{int(new_end.timestamp())}:F>",
+                    )
+
+            elif op_type == "extend":
+                delta_secs = payload.get("delta_seconds", 0)
+                if delta_secs > 0:
+                    row = await db_get_timer(channel_id)
+                    if row:
+                        base_end = datetime.fromisoformat(row["end_time"])
+                        new_end  = base_end + timedelta(seconds=delta_secs)
+                        err = validate_end_time(new_end)
+                        if not err:
+                            await db_update_timer_field(
+                                channel_id, end_time=new_end.isoformat(),
+                                warned_1h=False, warned_12h=False,
+                            )
+                            if channel:
+                                await safe_channel_edit(
+                                    channel,
+                                    name=format_timer_channel_name(row["name"], new_end),
+                                )
+                            start_timer_task(channel_id)
+                            await audit_log(
+                                action="DEFERRED EXTEND — EXECUTED", guild=guild,
+                                detail=(
+                                    f"delta={timedelta(seconds=delta_secs)}"
+                                    f"  new_end=<t:{int(new_end.timestamp())}:F>"
+                                ),
+                            )
+                            # After a deferred extend the timer continues — stop op processing
+                            await db_delete_deferred_op(op["id"])
+                            return
+
+            await db_delete_deferred_op(op["id"])
+
+        except Exception as e:
+            await log_error("_execute_deferred_ops", e, f"op_id={op['id']} type={op['op_type']}")
+
+
 async def run_timer_task(channel_id: str) -> None:
     await get_bot().wait_until_ready()
 
@@ -945,6 +1184,11 @@ async def run_timer_task(channel_id: str) -> None:
                 await cleanup_timer(channel_id, reason="channel not in cache")
                 return
 
+            # Guild whitelist guard (background task)
+            if not is_guild_allowed(channel.guild.id):
+                TIMER_TASKS.pop(channel_id, None)
+                return
+
             now  = datetime.now(timezone.utc)
             end  = datetime.fromisoformat(row["end_time"])
             secs = (end - now).total_seconds()
@@ -952,6 +1196,43 @@ async def run_timer_task(channel_id: str) -> None:
             # ── Timer ended ──────────────────────────────────────────
             if secs <= 0:
                 await asyncio.sleep(3)
+
+                # Execute deferred ops before final state change
+                await _execute_deferred_ops(channel_id, channel, channel.guild)
+
+                # Re-read row in case a deferred extend restarted the task
+                row = await db_get_timer(channel_id)
+                if not row:
+                    TIMER_TASKS.pop(channel_id, None)
+                    return
+                end  = datetime.fromisoformat(row["end_time"])
+                secs = (end - datetime.now(timezone.utc)).total_seconds()
+                if secs > 0:
+                    # A deferred extend restarted the timer — loop continues
+                    continue
+
+                # Check if there's a pending deferred delete
+                ops = await db_get_deferred_ops(channel_id)
+                has_deferred_delete = any(op["op_type"] == "delete" for op in ops)
+                if has_deferred_delete:
+                    await db_delete_deferred_ops(channel_id)
+                    try:
+                        await db_delete_timer(channel_id)
+                    except DBDiskFullError:
+                        TIMER_TASKS.pop(channel_id, None)
+                        return
+                    TIMER_TASKS.pop(channel_id, None)
+                    stale = [k for k, v in list(CURRENT_SELECTION.items()) if v == channel_id]
+                    for k in stale:
+                        CURRENT_SELECTION.pop(k, None)
+                    await safe_channel_delete(channel)
+                    await send_timer_log("⏹️ TIMER ENDED (DEFERRED DELETE)", row["name"], end)
+                    await audit_log(
+                        action="TIMER ENDED — DEFERRED DELETE",
+                        guild=channel.guild,
+                        detail=f"name={row['name']}  channel deleted",
+                    )
+                    return
 
                 if row["no_delete"]:
                     try:
@@ -986,10 +1267,29 @@ async def run_timer_task(channel_id: str) -> None:
                     )
                 return
 
-            # ── 1-hour warning ───────────────────────────────────────
-            if not row["warned"] and 0 < secs <= 3600:
+            # ── Dual reminder checkpoints ────────────────────────────
+            # 12-hour reminder (only if > 1 hour remains, prevents double-fire)
+            warned_12h = bool(row["warned_12h"]) if "warned_12h" in row.keys() else True
+            warned_1h  = bool(row["warned_1h"])  if "warned_1h"  in row.keys() else bool(row.get("warned", False))
+
+            if not warned_12h and 3600 < secs <= 43200:
+                await send_timer_log(
+                    "⏰ 12 HOURS REMAINING", row["name"], end, channel=channel
+                )
+                await db_update_timer_field(channel_id, warned_12h=True)
+                await audit_log(
+                    action="REMINDER — 12H", guild=channel.guild,
+                    detail=f"name={row['name']}",
+                )
+
+            # 1-hour reminder
+            if not warned_1h and 0 < secs <= 3600:
                 await send_timer_log("⚠️ 1 HOUR REMAINING", row["name"], end, channel=channel)
-                await db_update_timer_field(channel_id, warned=True)
+                await db_update_timer_field(channel_id, warned_1h=True)
+                await audit_log(
+                    action="REMINDER — 1H", guild=channel.guild,
+                    detail=f"name={row['name']}",
+                )
 
             # ── Update channel name ──────────────────────────────────
             new_name = format_timer_channel_name(row["name"], end)
@@ -1019,6 +1319,22 @@ async def run_timer_task(channel_id: str) -> None:
                 sleep_secs = wait_mins * 60 - now.second + end.second
                 if sleep_secs <= 2:
                     sleep_secs += 300
+            elif secs <= 43200:
+                # Within 12-hour reminder window — wake up on the 12h boundary
+                # if reminder hasn't fired yet, or fall through to hourly
+                fresh_12h = bool(fresh["warned_12h"]) if "warned_12h" in fresh.keys() else True
+                if not fresh_12h and secs > 3600:
+                    # Wake up when 12h boundary is crossed
+                    wake_at    = end - timedelta(hours=12)
+                    sleep_secs = max(5, (wake_at - now).total_seconds())
+                    sleep_secs = min(sleep_secs, 3600)
+                else:
+                    next_update = now.replace(minute=end.minute, second=end.second, microsecond=0)
+                    if next_update <= now:
+                        next_update += timedelta(hours=1)
+                    sleep_secs = (next_update - now).total_seconds()
+                    if sleep_secs < 2:
+                        sleep_secs += 3600
             else:
                 next_update = now.replace(minute=end.minute, second=end.second, microsecond=0)
                 if next_update <= now:
@@ -1180,6 +1496,105 @@ async def session_cleanup_loop() -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════
+# SCHEDULED TIMER CREATION LOOP
+# Polls the scheduled_timers table every 30 s, executes jobs whose
+# create_at time has passed, prevents duplicate execution via the
+# `executed` flag set before the channel is created.
+# ════════════════════════════════════════════════════════════════════════
+
+async def scheduled_timer_loop() -> None:
+    await get_bot().wait_until_ready()
+    await asyncio.sleep(10)   # let integrity check finish first
+
+    while True:
+        try:
+            now  = datetime.now(timezone.utc)
+            jobs = await db_all_scheduled_timers()
+
+            for job in jobs:
+                guild_id = int(job["guild_id"])
+                if not is_guild_allowed(guild_id):
+                    await db_mark_scheduled_executed(job["id"])
+                    continue
+
+                create_at = datetime.fromisoformat(job["create_at"])
+                if create_at > now:
+                    continue   # not yet
+
+                end_time = datetime.fromisoformat(job["end_time"])
+                err      = validate_end_time(end_time)
+
+                # Mark executed first to prevent duplicate runs after restart
+                try:
+                    await db_mark_scheduled_executed(job["id"])
+                except DBDiskFullError:
+                    continue   # skip this cycle, retry next poll
+
+                if err:
+                    await audit_log(
+                        action="SCHEDULED TIMER — SKIPPED (end in past)",
+                        result="warn",
+                        detail=f"name={job['name']}  end_time={job['end_time']}",
+                    )
+                    continue
+
+                guild = get_bot().get_guild(guild_id)
+                if not guild:
+                    await audit_log(
+                        action="SCHEDULED TIMER — SKIPPED (guild not found)",
+                        result="warn",
+                        detail=f"guild_id={guild_id}  name={job['name']}",
+                    )
+                    continue
+
+                channel_name = format_timer_channel_name(job["name"], end_time)
+                overwrites   = {
+                    guild.default_role: discord.PermissionOverwrite(
+                        view_channel=True, connect=False
+                    ),
+                    guild.me: discord.PermissionOverwrite(view_channel=True, connect=True),
+                }
+                try:
+                    ch = await guild.create_voice_channel(
+                        name=channel_name, overwrites=overwrites
+                    )
+                except Exception as e:
+                    await log_error("scheduled_timer_loop/create_channel", e,
+                                    f"name={job['name']}")
+                    continue
+
+                try:
+                    await db_upsert_timer(str(ch.id), job["name"], job["end_time"])
+                except DBDiskFullError:
+                    await safe_channel_delete(ch)
+                    await audit_log(
+                        action="SCHEDULED TIMER — DB FULL",
+                        result="error",
+                        detail=f"name={job['name']}  channel rolled back",
+                    )
+                    continue
+
+                start_timer_task(str(ch.id))
+                ts = int(end_time.timestamp())
+                await audit_log(
+                    action="SCHEDULED TIMER — CREATED",
+                    guild=guild,
+                    target_channel=ch,
+                    detail=f"name={job['name']}  end=<t:{ts}:F>",
+                )
+                await send_timer_log(
+                    "📅 SCHEDULED TIMER CREATED", job["name"], end_time, channel=ch
+                )
+
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            await log_error("scheduled_timer_loop", e)
+
+        await asyncio.sleep(30)
+
+
+# ════════════════════════════════════════════════════════════════════════
 # CONFIRMATION VIEW
 # ════════════════════════════════════════════════════════════════════════
 
@@ -1236,7 +1651,7 @@ class ExtendDurationSelect(discord.ui.Select):
             return await ix.reply_debounce(itx)
 
         try:
-            idx, (label, delta) = int(self.values[0]), EXTEND_OPTIONS[int(self.values[0])]
+            label, delta = EXTEND_OPTIONS[int(self.values[0])]
             row = await db_get_timer(self.channel_id)
             if not row:
                 return await ix.safe_send_response(itx, content="Timer not found.")
@@ -1246,14 +1661,31 @@ class ExtendDurationSelect(discord.ui.Select):
             if err:
                 return await ix.safe_send_response(itx, content=err)
 
-            ts           = int(new_end.timestamp())
-            confirm_view = ConfirmView()
+            ts = int(new_end.timestamp())
+
+            # ── Defer choice ─────────────────────────────────────────
+            defer_view = DeferChoiceView()
             await ix.safe_send_response(
                 itx,
                 content=(
                     f"Extend **{self.timer_name}** by **{label}**?\n"
-                    f"New end: <t:{ts}:F> (<t:{ts}:R>)"
+                    f"New end: <t:{ts}:F> (<t:{ts}:R>)\n\nWhen should this apply?"
                 ),
+                view=defer_view,
+            )
+            await defer_view.wait()
+            if defer_view.choice is None:
+                return
+
+            if not validate_session(itx.guild.id, itx.user.id, self.session_id):
+                return await ix.safe_followup(itx, "Session expired.")
+
+            # ── Confirm ──────────────────────────────────────────────
+            confirm_view = ConfirmView()
+            mode_label   = "immediately" if defer_view.choice == "immediate" else "when timer ends"
+            await ix.safe_followup(
+                itx,
+                content=f"Confirm extend **{self.timer_name}** by **{label}** — {mode_label}?",
                 view=confirm_view,
             )
             await confirm_view.wait()
@@ -1263,32 +1695,56 @@ class ExtendDurationSelect(discord.ui.Select):
             if not validate_session(itx.guild.id, itx.user.id, self.session_id):
                 return await ix.safe_followup(itx, "Session expired during confirmation.")
 
-            try:
-                await db_update_timer_field(
-                    self.channel_id, end_time=new_end.isoformat(), warned=False, no_delete=False
-                )
-            except DBDiskFullError:
-                return await ix.safe_followup(
+            if defer_view.choice == "immediate":
+                try:
+                    await db_update_timer_field(
+                        self.channel_id, end_time=new_end.isoformat(),
+                        warned_1h=False, warned_12h=False,
+                    )
+                except DBDiskFullError:
+                    return await ix.safe_followup(
+                        itx,
+                        "Database is full — extension could not be saved.\n"
+                        "The timer was not changed.",
+                    )
+                ch = itx.guild.get_channel(int(self.channel_id))
+                if ch:
+                    await safe_channel_edit(
+                        ch, name=format_timer_channel_name(self.timer_name, new_end)
+                    )
+                start_timer_task(self.channel_id)
+                await ix.safe_followup(
                     itx,
-                    "Database is full — extension could not be saved.\n"
-                    "The timer was not changed. Free up disk space and try again.",
+                    f"**{self.timer_name}** extended by **{label}**.\n"
+                    f"New end: <t:{ts}:F> (<t:{ts}:R>)",
+                )
+                await audit_log(
+                    action="EXTEND TIMER", guild=itx.guild, user=itx.user,
+                    target_channel=itx.guild.get_channel(int(self.channel_id)),
+                    detail=f"by {label}  new_end=<t:{ts}:F>",
+                    session_id=self.session_id,
+                )
+            else:
+                try:
+                    await db_add_deferred_op(
+                        self.channel_id, "extend",
+                        {"delta_seconds": int(delta.total_seconds())},
+                    )
+                except DBDiskFullError:
+                    return await ix.safe_followup(
+                        itx, "Database is full — deferred extend could not be queued."
+                    )
+                await ix.safe_followup(
+                    itx,
+                    f"Extension of **{label}** queued for **{self.timer_name}**.\n"
+                    "Will apply when the timer expires.",
+                )
+                await audit_log(
+                    action="EXTEND TIMER — DEFERRED", guild=itx.guild, user=itx.user,
+                    detail=f"by {label}  new_end would be <t:{ts}:F>",
+                    session_id=self.session_id,
                 )
 
-            ch = itx.guild.get_channel(int(self.channel_id))
-            if ch:
-                await safe_channel_edit(ch, name=format_timer_channel_name(self.timer_name, new_end))
-            start_timer_task(self.channel_id)
-
-            await ix.safe_followup(
-                itx,
-                f"**{self.timer_name}** extended by **{label}**.\n"
-                f"New end: <t:{ts}:F> (<t:{ts}:R>)",
-            )
-            await audit_log(
-                action="EXTEND TIMER", guild=itx.guild, user=itx.user,
-                target_channel=ch, detail=f"by {label}  new_end=<t:{ts}:F>",
-                session_id=self.session_id,
-            )
             await refresh_panel(itx, self.session_id)
         finally:
             _debounce_release(itx.guild.id, dkey)
@@ -1298,6 +1754,134 @@ class ExtendView(discord.ui.View):
     def __init__(self, channel_id: str, timer_name: str, session_id: str):
         super().__init__(timeout=60)
         self.add_item(ExtendDurationSelect(channel_id, timer_name, session_id))
+
+
+# ════════════════════════════════════════════════════════════════════════
+# DEFERRED CHOICE VIEW
+# Shown before the confirm dialog for Update / Extend / Delete.
+# ════════════════════════════════════════════════════════════════════════
+
+class DeferChoiceView(discord.ui.View):
+    """
+    Two-button prompt: ⚡ Apply Immediately  |  ⏳ Apply When Timer Ends
+    Sets `self.choice` to "immediate" | "deferred" | None (timeout/cancel).
+    """
+    def __init__(self):
+        super().__init__(timeout=60)
+        self.choice: str | None = None
+
+    @discord.ui.button(label="⚡ Apply Immediately", style=discord.ButtonStyle.primary,
+                        custom_id="defer_immediate")
+    async def btn_immediate(self, btn, itx: discord.Interaction):
+        self.choice = "immediate"
+        self.stop()
+        await ix.safe_defer(itx, ephemeral=True, silent=True)
+
+    @discord.ui.button(label="⏳ Apply When Timer Ends", style=discord.ButtonStyle.secondary,
+                        custom_id="defer_deferred")
+    async def btn_deferred(self, btn, itx: discord.Interaction):
+        self.choice = "deferred"
+        self.stop()
+        await ix.safe_defer(itx, ephemeral=True, silent=True)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# SCHEDULE TIMER MODAL
+# ════════════════════════════════════════════════════════════════════════
+
+class ScheduleTimerModal(discord.ui.Modal):
+    def __init__(self, session_id: str):
+        super().__init__(title="Schedule Timer Creation")
+        self.session_id  = session_id
+        self.name_input  = discord.ui.InputText(
+            label="Timer Name", placeholder="e.g. Season 4", required=True
+        )
+        self.cdate_input = discord.ui.InputText(
+            label="Create Date (YYYY-MM-DD, UTC)", placeholder="2026-07-01", required=True
+        )
+        self.ctime_input = discord.ui.InputText(
+            label="Create Time (HH:MM, UTC 24h)", placeholder="12:00", required=True
+        )
+        self.edate_input = discord.ui.InputText(
+            label="End Date (YYYY-MM-DD, UTC)", placeholder="2026-07-08", required=True
+        )
+        self.etime_input = discord.ui.InputText(
+            label="End Time (HH:MM, UTC 24h)", placeholder="18:00", required=True
+        )
+        self.add_item(self.name_input)
+        self.add_item(self.cdate_input)
+        self.add_item(self.ctime_input)
+        self.add_item(self.edate_input)
+        self.add_item(self.etime_input)
+
+    async def callback(self, itx: discord.Interaction):
+        if not validate_session(itx.guild.id, itx.user.id, self.session_id):
+            return await ix.reply_session_expired(itx)
+        touch_session(itx.guild.id, itx.user.id, self.session_id)
+
+        try:
+            create_at = datetime.fromisoformat(
+                f"{self.cdate_input.value}T{self.ctime_input.value}:00"
+            ).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return await ix.safe_modal_response(
+                itx, "Invalid create date/time.\nDate: `YYYY-MM-DD`   Time: `HH:MM`"
+            )
+
+        try:
+            end_time = datetime.fromisoformat(
+                f"{self.edate_input.value}T{self.etime_input.value}:00"
+            ).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return await ix.safe_modal_response(
+                itx, "Invalid end date/time.\nDate: `YYYY-MM-DD`   Time: `HH:MM`"
+            )
+
+        now = datetime.now(timezone.utc)
+        if create_at <= now:
+            return await ix.safe_modal_response(
+                itx, "The creation time is in the past. Please enter a future time."
+            )
+
+        err = validate_end_time(end_time)
+        if err:
+            return await ix.safe_modal_response(itx, err)
+
+        if end_time <= create_at:
+            return await ix.safe_modal_response(
+                itx, "The timer end must be **after** the creation time."
+            )
+
+        try:
+            await db_add_scheduled_timer(
+                itx.guild.id, self.name_input.value,
+                create_at.isoformat(), end_time.isoformat(),
+            )
+        except DBDiskFullError:
+            return await ix.safe_modal_response(
+                itx,
+                "Database is full — schedule could not be saved.\n"
+                "Free up disk space and try again.",
+            )
+
+        cts = int(create_at.timestamp())
+        ets = int(end_time.timestamp())
+        await ix.safe_modal_response(
+            itx,
+            f"Timer **{self.name_input.value}** scheduled.\n"
+            f"Creates: <t:{cts}:F> (<t:{cts}:R>)\n"
+            f"Expires: <t:{ets}:F>",
+        )
+        await audit_log(
+            action="SCHEDULE TIMER", guild=itx.guild, user=itx.user,
+            detail=(
+                f"name={self.name_input.value}"
+                f"  create=<t:{cts}:F>"
+                f"  end=<t:{ets}:F>"
+            ),
+            session_id=self.session_id,
+        )
+        await refresh_panel(itx, self.session_id)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1481,37 +2065,92 @@ class UpdateTimerModal(discord.ui.Modal):
             if not row:
                 return await ix.safe_modal_response(itx, "Timer no longer exists.")
 
-            try:
-                await db_update_timer_field(
-                    self.channel_id, name=self.name_input.value,
-                    end_time=end.isoformat(), warned=False
-                )
-            except DBDiskFullError:
-                return await ix.safe_modal_response(
-                    itx,
-                    "Database is full — update could not be saved.\n"
-                    "The timer was not changed. Free up disk space and try again.",
-                )
-
-            start_timer_task(self.channel_id)
-
-            ch = itx.guild.get_channel(int(self.channel_id))
-            if ch:
-                await safe_channel_edit(
-                    ch, name=format_timer_channel_name(self.name_input.value, end)
-                )
-
             ts = int(end.timestamp())
+
+            # ── Defer choice ─────────────────────────────────────────
+            defer_view = DeferChoiceView()
             await ix.safe_modal_response(
                 itx,
-                f"Timer **{self.name_input.value}** updated.\n"
-                f"New end: <t:{ts}:F> (<t:{ts}:R>)",
+                content=(
+                    f"Update **{row['name']}** → **{self.name_input.value}**\n"
+                    f"New end: <t:{ts}:F> (<t:{ts}:R>)\n\nWhen should this apply?"
+                ),
+                view=defer_view,
             )
-            await audit_log(
-                action="UPDATE TIMER", guild=itx.guild, user=itx.user,
-                target_channel=ch, detail=f"new_end=<t:{ts}:F>",
-                session_id=self.session_id,
+            await defer_view.wait()
+            if defer_view.choice is None:
+                return
+
+            if not validate_session(itx.guild.id, itx.user.id, self.session_id):
+                return await ix.safe_followup(itx, "Session expired.")
+
+            # ── Confirm ──────────────────────────────────────────────
+            confirm_view = ConfirmView()
+            mode_label   = "immediately" if defer_view.choice == "immediate" else "when timer ends"
+            await ix.safe_followup(
+                itx,
+                content=f"Confirm update **{self.name_input.value}** — {mode_label}?",
+                view=confirm_view,
             )
+            await confirm_view.wait()
+            if not confirm_view.confirmed:
+                return
+
+            if not validate_session(itx.guild.id, itx.user.id, self.session_id):
+                return await ix.safe_followup(itx, "Session expired during confirmation.")
+
+            if defer_view.choice == "immediate":
+                try:
+                    await db_update_timer_field(
+                        self.channel_id, name=self.name_input.value,
+                        end_time=end.isoformat(), warned_1h=False, warned_12h=False,
+                    )
+                except DBDiskFullError:
+                    return await ix.safe_followup(
+                        itx,
+                        "Database is full — update could not be saved.\n"
+                        "The timer was not changed.",
+                    )
+                start_timer_task(self.channel_id)
+                ch = itx.guild.get_channel(int(self.channel_id))
+                if ch:
+                    await safe_channel_edit(
+                        ch, name=format_timer_channel_name(self.name_input.value, end)
+                    )
+                await ix.safe_followup(
+                    itx,
+                    f"Timer **{self.name_input.value}** updated.\nNew end: <t:{ts}:F> (<t:{ts}:R>)",
+                )
+                await audit_log(
+                    action="UPDATE TIMER", guild=itx.guild, user=itx.user,
+                    target_channel=itx.guild.get_channel(int(self.channel_id)),
+                    detail=f"new_end=<t:{ts}:F>",
+                    session_id=self.session_id,
+                )
+            else:
+                try:
+                    await db_add_deferred_op(
+                        self.channel_id, "update",
+                        {"name": self.name_input.value, "end_time": end.isoformat()},
+                    )
+                except DBDiskFullError:
+                    return await ix.safe_followup(
+                        itx, "Database is full — deferred update could not be queued."
+                    )
+                await ix.safe_followup(
+                    itx,
+                    f"Update queued for **{row['name']}**.\n"
+                    f"Will apply when the timer expires.",
+                )
+                await audit_log(
+                    action="UPDATE TIMER — DEFERRED", guild=itx.guild, user=itx.user,
+                    detail=(
+                        f"new_name={self.name_input.value}  "
+                        f"new_end=<t:{ts}:F>"
+                    ),
+                    session_id=self.session_id,
+                )
+
             await refresh_panel(itx, self.session_id)
         finally:
             _debounce_release(itx.guild.id, dkey)
@@ -1868,10 +2507,26 @@ class AdminPanelView(discord.ui.View):
             return await ix.reply_debounce(itx)
 
         try:
-            confirm_view = ConfirmView()
+            # ── Defer choice ─────────────────────────────────────────
+            defer_view = DeferChoiceView()
             await ix.safe_send_response(
                 itx,
-                content=f"Delete **{row['name']}**? This cannot be undone.",
+                content=f"Delete **{row['name']}**?\nWhen should this apply?",
+                view=defer_view,
+            )
+            await defer_view.wait()
+            if defer_view.choice is None:
+                return
+
+            if not validate_session(itx.guild.id, itx.user.id, self.session_id):
+                return await ix.safe_followup(itx, "Session expired.")
+
+            # ── Confirm ──────────────────────────────────────────────
+            confirm_view = ConfirmView()
+            mode_label   = "immediately" if defer_view.choice == "immediate" else "when timer ends"
+            await ix.safe_followup(
+                itx,
+                content=f"Confirm delete **{row['name']}** — {mode_label}? This cannot be undone.",
                 view=confirm_view,
             )
             await confirm_view.wait()
@@ -1881,36 +2536,57 @@ class AdminPanelView(discord.ui.View):
             if not validate_session(itx.guild.id, itx.user.id, self.session_id):
                 return await ix.safe_followup(itx, "Session expired during confirmation.")
 
-            ch  = itx.guild.get_channel(int(cid))
-            old = TIMER_TASKS.pop(cid, None)
-            if old:
-                old.cancel()
+            if defer_view.choice == "immediate":
+                ch  = itx.guild.get_channel(int(cid))
+                old = TIMER_TASKS.pop(cid, None)
+                if old:
+                    old.cancel()
 
-            try:
-                await db_delete_timer(cid)
-            except DBDiskFullError:
-                start_timer_task(cid)
-                return await ix.safe_followup(
+                try:
+                    await db_delete_deferred_ops(cid)
+                    await db_delete_timer(cid)
+                except DBDiskFullError:
+                    start_timer_task(cid)
+                    return await ix.safe_followup(
+                        itx,
+                        "Database is full — timer record could not be deleted.\n"
+                        "The Discord channel was not deleted.",
+                    )
+
+                stale = [k for k, v in list(CURRENT_SELECTION.items()) if v == cid]
+                for k in stale:
+                    CURRENT_SELECTION.pop(k, None)
+
+                if ch:
+                    await safe_channel_delete(ch)
+                    await ix.safe_followup(itx, f"**{row['name']}** deleted.")
+                else:
+                    await ix.safe_followup(
+                        itx, "Timer removed from database (channel was already gone)."
+                    )
+                await audit_log(
+                    action="DELETE TIMER", guild=itx.guild, user=itx.user,
+                    target_channel=ch or cid, detail=f"name={row['name']}",
+                    session_id=self.session_id,
+                )
+            else:
+                try:
+                    await db_add_deferred_op(cid, "delete", {})
+                except DBDiskFullError:
+                    return await ix.safe_followup(
+                        itx, "Database is full — deferred delete could not be queued."
+                    )
+                await ix.safe_followup(
                     itx,
-                    "Database is full — timer record could not be deleted.\n"
-                    "The Discord channel was not deleted.",
+                    f"Delete queued for **{row['name']}**.\n"
+                    "The timer will run normally and be deleted when it expires.",
+                )
+                await audit_log(
+                    action="DELETE TIMER — DEFERRED", guild=itx.guild, user=itx.user,
+                    detail=f"name={row['name']}",
+                    session_id=self.session_id,
                 )
 
-            stale = [k for k, v in list(CURRENT_SELECTION.items()) if v == cid]
-            for k in stale:
-                CURRENT_SELECTION.pop(k, None)
-
-            if ch:
-                await safe_channel_delete(ch)
-                await ix.safe_followup(itx, f"**{row['name']}** deleted.")
-            else:
-                await ix.safe_followup(itx, "Timer removed from database (channel was already gone).")
-
-            await audit_log(
-                action="DELETE TIMER", guild=itx.guild, user=itx.user,
-                target_channel=ch or cid, detail=f"name={row['name']}",
-                session_id=self.session_id,
-            )
             await refresh_panel(itx, self.session_id)
         finally:
             _debounce_release(itx.guild.id, dkey)
@@ -1978,36 +2654,127 @@ class AdminPanelView(discord.ui.View):
         finally:
             _debounce_release(itx.guild.id, dkey)
 
+    # ── 📅 Schedule ──────────────────────────────────────────────────
+    @discord.ui.button(emoji="📅", style=discord.ButtonStyle.secondary, custom_id="panel_schedule")
+    async def btn_schedule(self, btn, itx: discord.Interaction):
+        if not self._auth(itx):
+            return await ix.reply_session_expired(itx)
+        await ix.safe_send_modal(itx, ScheduleTimerModal(self.session_id))
+
     # ── 📊 Overview ──────────────────────────────────────────────────
     @discord.ui.button(emoji="📊", style=discord.ButtonStyle.secondary, custom_id="panel_view")
     async def btn_view(self, btn, itx: discord.Interaction):
         if not self._auth(itx):
             return await ix.reply_session_expired(itx)
-        rows = await db_all_timers()
-        if not rows:
-            return await ix.safe_send_response(itx, content="No timers.")
+
+        timer_rows    = await db_all_timers()
+        tour_rows     = await db_all_tournament_channels()
+        skip_active   = await db_get_skip_next()
+        scheduled     = await db_all_scheduled_timers()
+        sizes         = _db_file_sizes()
+        free_mb       = _free_disk_mb()
 
         v = discord.ui.DesignerView()
-        for row in rows:
-            try:
-                if row["ended"]:
-                    c = discord.ui.Container(color=discord.Color.dark_gray())
-                    c.add_text(f"**{row['name']}** — ENDED")
-                    c.add_separator(divider=True)
-                    c.add_text("Archived. Delete via 🗑️.")
-                else:
+
+        # ── Active timers ───────────────────────────────────────────
+        active  = [r for r in timer_rows if not r["ended"]]
+        endmode = [r for r in active if r["no_delete"]]
+        normal  = [r for r in active if not r["no_delete"]]
+        ended   = [r for r in timer_rows if r["ended"]]
+
+        if normal:
+            c = discord.ui.Container(color=discord.Color.blurple())
+            c.add_text("**Active Timers**")
+            c.add_separator(divider=True)
+            for row in normal:
+                try:
+                    end    = datetime.fromisoformat(row["end_time"])
+                    ts     = int(end.timestamp())
+                    ops    = await db_get_deferred_ops(row["channel_id"])
+                    badges = ""
+                    if any(o["op_type"] == "delete" for o in ops):
+                        badges += " ⏳🗑"
+                    elif ops:
+                        badges += " ⏳"
+                    c.add_text(f"**{row['name']}**{badges}  —  <t:{ts}:R>  (<t:{ts}:F>)")
+                except Exception:
+                    pass
+            v.add_item(c)
+
+        if endmode:
+            c2 = discord.ui.Container(color=discord.Color.orange())
+            c2.add_text("**End Mode Timers**")
+            c2.add_separator(divider=True)
+            for row in endmode:
+                try:
                     end = datetime.fromisoformat(row["end_time"])
                     ts  = int(end.timestamp())
-                    c   = discord.ui.Container(color=discord.Color.blurple())
-                    c.add_text(f"**{row['name']}**")
-                    c.add_separator(divider=True)
-                    c.add_text(f"<t:{ts}:F>\n<t:{ts}:R>")
-                    if row["no_delete"]:
-                        c.add_separator(divider=True)
-                        c.add_text("🏁 End Mode: ON")
-                v.add_item(c)
-            except Exception:
-                continue
+                    c2.add_text(f"🏁 **{row['name']}**  —  <t:{ts}:R>  (<t:{ts}:F>)")
+                except Exception:
+                    pass
+            v.add_item(c2)
+
+        if ended:
+            c3 = discord.ui.Container(color=discord.Color.dark_gray())
+            c3.add_text("**Archived / Ended Timers**")
+            c3.add_separator(divider=True)
+            for row in ended:
+                c3.add_text(f"● {row['name']}  —  ENDED  (delete via 🗑)")
+            v.add_item(c3)
+
+        if not timer_rows:
+            c_empty = discord.ui.Container(color=discord.Color.dark_gray())
+            c_empty.add_text("No timers.")
+            v.add_item(c_empty)
+
+        # ── Scheduled timers ─────────────────────────────────────────
+        if scheduled:
+            cs = discord.ui.Container(color=discord.Color.teal())
+            cs.add_text("**Scheduled Creations**")
+            cs.add_separator(divider=True)
+            for job in scheduled:
+                try:
+                    cts = int(datetime.fromisoformat(job["create_at"]).timestamp())
+                    ets = int(datetime.fromisoformat(job["end_time"]).timestamp())
+                    cs.add_text(
+                        f"📅 **{job['name']}**\n"
+                        f"Creates: <t:{cts}:F> (<t:{cts}:R>)\n"
+                        f"Expires: <t:{ets}:F>"
+                    )
+                except Exception:
+                    pass
+            v.add_item(cs)
+
+        # ── Tournament ────────────────────────────────────────────────
+        ct = discord.ui.Container(color=discord.Color.gold())
+        ct.add_text("**Tournament**")
+        ct.add_separator(divider=True)
+        tour_active = False
+        for trow in tour_rows:
+            ch = itx.guild.get_channel(int(trow["channel_id"]))
+            if ch:
+                tour_active = True
+                ct.add_text(f"Channel: {ch.mention}")
+        if not tour_active:
+            ct.add_text("No active channel.")
+        ct.add_text("Skip: **active** — showing next week" if skip_active else "Skip: none")
+        v.add_item(ct)
+
+        # ── DB stats ──────────────────────────────────────────────────
+        db_mb  = sizes["db"]  / (1024 * 1024)
+        wal_mb = sizes["wal"] / (1024 * 1024)
+        cd = discord.ui.Container(
+            color=discord.Color.yellow() if (0 <= free_mb < 200) else discord.Color.dark_gray()
+        )
+        cd.add_text("**Database**")
+        cd.add_separator(divider=True)
+        cd.add_text(
+            f"DB: {db_mb:.2f} MB  ·  WAL: {wal_mb:.2f} MB"
+            + (f"\n⚠️ Low disk: {free_mb:.0f} MB free" if 0 <= free_mb < 200 else
+               f"\nFree: {free_mb:.0f} MB")
+        )
+        v.add_item(cd)
+
         await ix.safe_send_response(itx, view=v)
 
     # ── 🏆 Tournament ────────────────────────────────────────────────
@@ -2088,6 +2855,9 @@ class PanelLoginView(discord.ui.View):
 
     @discord.ui.button(label="Login", style=discord.ButtonStyle.green, custom_id="panel_login")
     async def btn_login(self, btn, itx: discord.Interaction):
+        if not is_guild_allowed(itx.guild.id):
+            return await ix.safe_send_response(itx, content="This guild is not authorized.")
+
         if not (itx.user.guild_permissions.administrator or itx.user.id in DAX):
             await audit_log(
                 action="UNAUTHORIZED LOGIN ATTEMPT",
@@ -2153,37 +2923,14 @@ class PanelLoginView(discord.ui.View):
 async def _build_panel_view(guild, session_id: str) -> discord.ui.DesignerView:
     view = discord.ui.DesignerView(timeout=86400)
 
-    # ── Header ───────────────────────────────────────────────────────
-    timer_rows  = await db_all_timers()
-    tour_rows   = await db_all_tournament_channels()
-    skip_active = await db_get_skip_next()
-
-    active_count   = sum(1 for r in timer_rows if not r["ended"])
-    archived_count = sum(1 for r in timer_rows if r["ended"])
-    tour_active    = False
-    for trow in tour_rows:
-        if guild.get_channel(int(trow["channel_id"])):
-            tour_active = True
-            break
-
-    s = get_session(guild.id)
+    # ── Header only (no live data containers) ────────────────────────
+    s            = get_session(guild.id)
     session_user = s["user_name"] if s else "—"
 
     header = discord.ui.Container(color=discord.Color.blurple())
     header.add_text("**Timer Control Panel**")
     header.add_separator(divider=True)
-
-    # Compact status line
-    status_parts = [
-        f"Timers: **{active_count}** active",
-    ]
-    if archived_count:
-        status_parts.append(f"**{archived_count}** archived")
-    status_parts.append(f"Tournament: **{'active' if tour_active else 'none'}**")
-    if skip_active:
-        status_parts.append("⏭ skip")
-    status_parts.append(f"Session: **{session_user}**")
-    header.add_text("  ·  ".join(status_parts))
+    header.add_text(f"Session: **{session_user}**")
     header.add_separator(divider=True)
 
     # Controls reference — one line per button
@@ -2193,6 +2940,7 @@ async def _build_panel_view(guild, session_id: str) -> discord.ui.DesignerView:
         "🗑  Delete selected\n"
         "⏳  Extend selected\n"
         "🏁  End Mode selected\n"
+        "📅  Schedule future timer\n"
         "📊  Overview\n"
         "🏆  Tournament\n"
         "🌐  Timezone\n"
@@ -2200,51 +2948,29 @@ async def _build_panel_view(guild, session_id: str) -> discord.ui.DesignerView:
     )
     view.add_item(header)
 
-    # ── Active timers ─────────────────────────────────────────────────
-    if timer_rows:
-        tlist = discord.ui.Container(color=discord.Color.dark_blue())
-        tlist.add_text("**Timers**")
-        tlist.add_separator(divider=True)
-        for row in timer_rows[:10]:
-            try:
-                if row["ended"]:
-                    tlist.add_text(f"● {row['name']}  —  ENDED")
-                else:
-                    end   = datetime.fromisoformat(row["end_time"])
-                    ts    = int(end.timestamp())
-                    badge = "🏁 " if row["no_delete"] else ""
-                    tlist.add_text(f"{badge}{row['name']}  —  <t:{ts}:R>")
-            except Exception:
-                pass
-        view.add_item(tlist)
-
-    # ── Tournament status ─────────────────────────────────────────────
-    if tour_rows:
-        for trow in tour_rows:
-            ch = guild.get_channel(int(trow["channel_id"]))
-            if ch:
-                tc = discord.ui.Container(color=discord.Color.gold())
-                skip_note = "  ⏭" if skip_active else ""
-                tc.add_text(f"🏆 {ch.mention}{skip_note}")
-                view.add_item(tc)
-
     # ── Timer dropdown ────────────────────────────────────────────────
+    timer_rows   = await db_all_timers()
     dropdown_row = discord.ui.ActionRow(
         TimerSelect(guild, timer_rows, session_id)
     )
     view.add_item(dropdown_row)
 
-    # ── Action buttons (emoji-only, 3 per row) ────────────────────────
+    # ── Action buttons (emoji-only)
+    # Row layout: ➕ ✏ 🗑  |  ⏳ 🏁 📅  |  📊 🏆 🌐  |  🔒
     apv     = AdminPanelView(guild, session_id)
-    buttons = apv.children   # ➕ ✏ 🗑 ⏳ 🏁 📊 🏆 🌐 🔒
+    buttons = apv.children
+    # buttons order defined by @discord.ui.button declarations:
+    # 0=➕  1=✏  2=🗑  3=⏳  4=🏁  5=📅  6=📊  7=🏆  8=🌐  9=🔒
 
     row1 = discord.ui.ActionRow(buttons[0], buttons[1], buttons[2])   # ➕ ✏ 🗑
-    row2 = discord.ui.ActionRow(buttons[3], buttons[4], buttons[5])   # ⏳ 🏁 📊
-    row3 = discord.ui.ActionRow(buttons[6], buttons[7], buttons[8])   # 🏆 🌐 🔒
+    row2 = discord.ui.ActionRow(buttons[3], buttons[4], buttons[5])   # ⏳ 🏁 📅
+    row3 = discord.ui.ActionRow(buttons[6], buttons[7], buttons[8])   # 📊 🏆 🌐
+    row4 = discord.ui.ActionRow(buttons[9])                            # 🔒
 
     view.add_item(row1)
     view.add_item(row2)
     view.add_item(row3)
+    view.add_item(row4)
 
     return view
 
@@ -2258,6 +2984,9 @@ def _is_admin(ctx) -> bool:
 
 
 async def cmd_timerpanel_handler(ctx) -> None:
+    if not is_guild_allowed(ctx.guild.id):
+        return await ctx.respond("This guild is not authorized.", ephemeral=True)
+
     if not _is_admin(ctx):
         await audit_log(
             action="UNAUTHORIZED /timerpanel",
@@ -2306,6 +3035,11 @@ async def startup_integrity_check() -> None:
             await cleanup_timer(row["channel_id"], reason="channel missing on startup")
             continue
 
+        # Skip timers in non-whitelisted guilds
+        if not is_guild_allowed(ch.guild.id):
+            print(f"[Startup] Timer in non-whitelisted guild, skipping: {row['channel_id']}")
+            continue
+
         try:
             end      = datetime.fromisoformat(row["end_time"])
             new_name = format_timer_channel_name(row["name"], end)
@@ -2322,6 +3056,9 @@ async def startup_integrity_check() -> None:
             print(f"[Startup] Orphaned tournament channel removed: {trow['channel_id']}")
             await db_delete_tournament_channel(trow["channel_id"])
             continue
+        if not is_guild_allowed(ch.guild.id):
+            print(f"[Startup] Tournament in non-whitelisted guild, skipping: {trow['channel_id']}")
+            continue
         try:
             msg = await ch.fetch_message(int(trow["message_id"]))
             start_tournament_task(ch, msg)
@@ -2331,5 +3068,17 @@ async def startup_integrity_check() -> None:
             await db_delete_tournament_channel(trow["channel_id"])
         except Exception as e:
             print(f"[Startup] Tournament restore error for #{ch.name}: {e}")
+
+    # Scheduled timers — evict any that have already passed their end_time
+    # (create_at already passed handled by scheduled_timer_loop)
+    now = datetime.now(timezone.utc)
+    for job in await db_all_scheduled_timers():
+        try:
+            end_time = datetime.fromisoformat(job["end_time"])
+            if end_time <= now:
+                print(f"[Startup] Scheduled timer expired before creation, removing: {job['id']}")
+                await db_mark_scheduled_executed(job["id"])
+        except Exception as e:
+            print(f"[Startup] Scheduled timer check error for id={job['id']}: {e}")
 
     print("[Startup] Integrity check complete.")
