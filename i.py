@@ -165,9 +165,9 @@ def _classify(exc: discord.HTTPException) -> str:
     return "HTTP"
 
 
-async def _backoff(exc: discord.RateLimited) -> None:
-    """Sleep for the Discord-specified retry-after duration."""
-    await asyncio.sleep(getattr(exc, "retry_after", 1.0) + 0.25)
+async def _backoff(exc: discord.HTTPException) -> None:
+    """Sleep for the Discord-specified retry-after duration (rate-limit or 429)."""
+    await asyncio.sleep(float(getattr(exc, "retry_after", 1.0)) + 0.25)
 
 
 def _maybe_strip_content(
@@ -243,8 +243,6 @@ async def safe_send_response(
             except Exception:
                 return IxResult.DOUBLE
 
-        except discord.RateLimited as e:
-            await _backoff(e)
 
         except discord.NotFound as e:
             if not silent:
@@ -253,6 +251,9 @@ async def safe_send_response(
 
         except discord.HTTPException as e:
             tag = _classify(e)
+            if tag == "RATE_LIMIT":
+                await _backoff(e)
+                continue
             if tag in ("STALE", "DOUBLE"):
                 return IxResult.STALE
             if attempt < max_retries:
@@ -306,8 +307,6 @@ async def safe_edit_response(
             await itx.edit_original_response(**kw)
             return IxResult.OK
 
-        except discord.RateLimited as e:
-            await _backoff(e)
 
         except discord.NotFound as e:
             # Token expired — try response.edit_message then followup
@@ -339,6 +338,9 @@ async def safe_edit_response(
 
         except discord.HTTPException as e:
             tag = _classify(e)
+            if tag == "RATE_LIMIT":
+                await _backoff(e)
+                continue
             if tag == "COMPONENTS":
                 # Strip content and retry once more
                 content = None
@@ -407,8 +409,6 @@ async def safe_followup(
             await itx.followup.send(**kw)
             return IxResult.OK
 
-        except discord.RateLimited as e:
-            await _backoff(e)
 
         except discord.NotFound as e:
             if not silent:
@@ -417,6 +417,9 @@ async def safe_followup(
 
         except discord.HTTPException as e:
             tag = _classify(e)
+            if tag == "RATE_LIMIT":
+                await _backoff(e)
+                continue
             if tag == "STALE":
                 return IxResult.STALE
             if attempt < max_retries:
@@ -467,8 +470,6 @@ async def safe_panel_refresh(
             await itx.edit_original_response(content=None, view=new_view)
             return IxResult.OK
 
-        except discord.RateLimited as e:
-            await _backoff(e)
 
         except discord.NotFound as e:
             # Token expired — send panel as a fresh followup instead
@@ -486,6 +487,9 @@ async def safe_panel_refresh(
 
         except discord.HTTPException as e:
             tag = _classify(e)
+            if tag == "RATE_LIMIT":
+                await _backoff(e)
+                continue
             if tag == "COMPONENTS":
                 # content=None should prevent this — log and give up
                 if not silent:
@@ -541,8 +545,6 @@ async def safe_logout_response(
             return IxResult.OK
         except discord.InteractionResponded:
             pass
-        except discord.RateLimited as e:
-            await _backoff(e)
         except discord.NotFound:
             pass  # token expired — move to fallback
         except discord.HTTPException:
@@ -603,8 +605,6 @@ async def safe_components_edit(
             except Exception:
                 return IxResult.DOUBLE
 
-        except discord.RateLimited as e:
-            await _backoff(e)
 
         except discord.NotFound as e:
             # Token expired — send as a new ephemeral followup
@@ -619,6 +619,9 @@ async def safe_components_edit(
 
         except discord.HTTPException as e:
             tag = _classify(e)
+            if tag == "RATE_LIMIT":
+                await _backoff(e)
+                continue
             if tag == "COMPONENTS":
                 if not silent:
                     await _log("safe_components_edit/COMPONENTS", e)
