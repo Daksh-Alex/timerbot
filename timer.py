@@ -55,7 +55,7 @@ SESSION_TIMEOUT_SECS  = 15 * 60   # 15 minutes of inactivity
 # Only guilds in this set may use the bot. Any other guild triggers an
 # immediate leave. Add your authorized guild IDs here.
 ALLOWED_GUILDS: set[int] = {
-    1452099895564439682,   # replace with actual guild IDs
+    1485974710847013014,   # replace with actual guild IDs
     1428800178848010331,
 }
 
@@ -188,6 +188,15 @@ def _debounce_release(guild_id: int, key: str) -> None:
 
 # Mutex protecting tournament channel creation against race conditions
 _TOURNAMENT_CREATION_LOCK = asyncio.Lock()
+
+# Per-guild mutex preventing concurrent timer creation from the same guild
+# (guards against Discord duplicate interaction delivery and double-clicks)
+_TIMER_CREATION_LOCKS: dict[int, asyncio.Lock] = {}
+
+# Idempotency set: interaction IDs that have already entered CreateTimerModal.callback
+# Prevents duplicate execution if Discord re-delivers the same modal submission.
+# Entries are removed after the callback completes (success or error).
+_CREATE_INTERACTION_IDS: set[int] = set()
 
 # ════════════════════════════════════════════════════════════════════════
 # DATABASE LAYER
@@ -714,7 +723,12 @@ async def db_mark_scheduled_executed(row_id: int) -> None:
 
 
 async def db_cancel_scheduled_updates(channel_id: str) -> None:
-    """Mark all pending scheduled update jobs for this timer as executed (cancelled)."""
+    """
+    Mark all pending scheduled jobs for this timer as executed (cancelled).
+    Uses channel_id — the timer's channel identifier — to target update_timer
+    jobs that belong to this timer. Safe to call when channel_id has no
+    matching rows (no-op).
+    """
     try:
         await _db_exec(
             "UPDATE scheduled_timers SET executed = 1 WHERE channel_id = ? AND executed = 0",
@@ -726,6 +740,10 @@ async def db_cancel_scheduled_updates(channel_id: str) -> None:
     except DBError as e:
         await log_error("db_cancel_scheduled_updates", e)
         raise
+
+
+async def db_delete_scheduled_timer(row_id: int) -> None:
+    """Hard-delete a scheduled_timers row by its primary key."""
     try:
         await _db_exec("DELETE FROM scheduled_timers WHERE id = ?", (row_id,))
     except DBDiskFullError as e:
@@ -1995,6 +2013,42 @@ class CreateTimerModal(discord.ui.Modal):
         self.add_item(self.stime_input)
 
     async def callback(self, itx: discord.Interaction):
+        # ── Idempotency guard — block duplicate interaction delivery ──────
+        # Discord occasionally re-delivers the same modal submission (same
+        # interaction ID) under high latency. Reject any re-entrant call for
+        # the same interaction ID before doing any work.
+        iid = itx.id
+        if iid in _CREATE_INTERACTION_IDS:
+            print(
+                f"[CREATE][DUPLICATE BLOCKED] itx_id={iid} "
+                f"user={itx.user.id} guild={itx.guild.id} "
+                f"ts={datetime.now(timezone.utc).isoformat()}"
+            )
+            return
+        _CREATE_INTERACTION_IDS.add(iid)
+
+        print(
+            f"[CREATE][ENTER] itx_id={iid} "
+            f"user={itx.user.id} guild={itx.guild.id} "
+            f"ts={datetime.now(timezone.utc).isoformat()}"
+        )
+
+        # ── Per-guild creation mutex — serialise concurrent creates ───────
+        guild_lock = _TIMER_CREATION_LOCKS.setdefault(itx.guild.id, asyncio.Lock())
+
+        try:
+            async with guild_lock:
+                await self._run(itx)
+        finally:
+            _CREATE_INTERACTION_IDS.discard(iid)
+            print(
+                f"[CREATE][EXIT] itx_id={iid} "
+                f"user={itx.user.id} guild={itx.guild.id} "
+                f"ts={datetime.now(timezone.utc).isoformat()}"
+            )
+
+    async def _run(self, itx: discord.Interaction):
+        """Inner callback body — always runs under the per-guild creation mutex."""
         if not validate_session(itx.guild.id, itx.user.id, self.session_id):
             return await ix.reply_session_expired(itx)
         touch_session(itx.guild.id, itx.user.id, self.session_id)
