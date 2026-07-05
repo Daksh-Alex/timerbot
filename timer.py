@@ -47,7 +47,8 @@ DAX: set[int] = {
 }
 
 DB_PATH               = "bot.db"
-MAX_YEARS_AHEAD       = 10
+MAX_YEARS_AHEAD       = 2
+MAX_NAME_LENGTH       = 30        # maximum timer name length (characters)
 SESSION_TIMEOUT_SECS  = 15 * 60   # 15 minutes of inactivity
 
 # ── Guild whitelist ───────────────────────────────────────────────────
@@ -461,13 +462,17 @@ async def init_db() -> None:
                 FOREIGN KEY (channel_id) REFERENCES timers(channel_id) ON DELETE CASCADE
             );
 
-            -- Scheduled timer creation jobs
+            -- Scheduled timer creation / update jobs
+            -- op_type: 'create_timer' | 'update_timer'
+            -- channel_id: NULL for create_timer, timer's channel_id for update_timer
             CREATE TABLE IF NOT EXISTS scheduled_timers (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id        TEXT NOT NULL,
                 name            TEXT NOT NULL,
-                create_at       TEXT NOT NULL,   -- UTC ISO, when to create the channel
+                create_at       TEXT NOT NULL,   -- UTC ISO, when to execute the job
                 end_time        TEXT NOT NULL,   -- UTC ISO, the timer's actual expiry
+                op_type         TEXT NOT NULL DEFAULT 'create_timer',
+                channel_id      TEXT,            -- NULL for create_timer; set for update_timer
                 executed        INTEGER NOT NULL DEFAULT 0,
                 created_at_row  TEXT NOT NULL
             );
@@ -475,9 +480,12 @@ async def init_db() -> None:
 
         # ── Safe column migrations for existing databases ────────────────
         migrations = [
-            ("timers",  "ended",      "INTEGER NOT NULL DEFAULT 0"),
-            ("timers",  "warned_1h",  "INTEGER NOT NULL DEFAULT 0"),
-            ("timers",  "warned_12h", "INTEGER NOT NULL DEFAULT 0"),
+            ("timers",            "ended",      "INTEGER NOT NULL DEFAULT 0"),
+            ("timers",            "warned_1h",  "INTEGER NOT NULL DEFAULT 0"),
+            ("timers",            "warned_12h", "INTEGER NOT NULL DEFAULT 0"),
+            # scheduled_timers additions (op_type + channel_id for update jobs)
+            ("scheduled_timers",  "op_type",    "TEXT NOT NULL DEFAULT 'create_timer'"),
+            ("scheduled_timers",  "channel_id", "TEXT"),
         ]
         for table, col, typedef in migrations:
             try:
@@ -667,14 +675,15 @@ async def db_delete_deferred_op(op_id: int) -> None:
 # ── Scheduled timers CRUD ─────────────────────────────────────────────
 
 async def db_add_scheduled_timer(
-    guild_id: int, name: str, create_at: str, end_time: str
+    guild_id: int, name: str, create_at: str, end_time: str,
+    op_type: str = "create_timer", channel_id: str | None = None,
 ) -> None:
     try:
         await _db_exec(
             """INSERT INTO scheduled_timers
-               (guild_id, name, create_at, end_time, executed, created_at_row)
-               VALUES (?, ?, ?, ?, 0, ?)""",
-            (str(guild_id), name, create_at, end_time,
+               (guild_id, name, create_at, end_time, op_type, channel_id, executed, created_at_row)
+               VALUES (?, ?, ?, ?, ?, ?, 0, ?)""",
+            (str(guild_id), name, create_at, end_time, op_type, channel_id,
              datetime.now(timezone.utc).isoformat()),
         )
     except DBDiskFullError as e:
@@ -704,7 +713,19 @@ async def db_mark_scheduled_executed(row_id: int) -> None:
         raise
 
 
-async def db_delete_scheduled_timer(row_id: int) -> None:
+async def db_cancel_scheduled_updates(channel_id: str) -> None:
+    """Mark all pending scheduled update jobs for this timer as executed (cancelled)."""
+    try:
+        await _db_exec(
+            "UPDATE scheduled_timers SET executed = 1 WHERE channel_id = ? AND executed = 0",
+            (channel_id,),
+        )
+    except DBDiskFullError as e:
+        await _handle_db_disk_full("db_cancel_scheduled_updates", e, channel_id)
+        raise
+    except DBError as e:
+        await log_error("db_cancel_scheduled_updates", e)
+        raise
     try:
         await _db_exec("DELETE FROM scheduled_timers WHERE id = ?", (row_id,))
     except DBDiskFullError as e:
@@ -840,6 +861,18 @@ async def send_timer_log(
 # VALIDATION
 # ════════════════════════════════════════════════════════════════════════
 
+def validate_timer_name(name: str) -> str | None:
+    """Returns an error string if the name is invalid, else None."""
+    if len(name) > MAX_NAME_LENGTH:
+        return (
+            f"Timer name is too long ({len(name)} characters).\n"
+            f"Maximum length is **{MAX_NAME_LENGTH}** characters."
+        )
+    if not name.strip():
+        return "Timer name cannot be empty."
+    return None
+
+
 def validate_end_time(end: datetime) -> str | None:
     now = datetime.now(timezone.utc)
     if end <= now:
@@ -848,7 +881,7 @@ def validate_end_time(end: datetime) -> str | None:
     if end > max_end:
         return (
             f"Date too far in the future.\n"
-            f"Maximum: **{max_end.strftime('%Y-%m-%d')}** (current year + {MAX_YEARS_AHEAD})."
+            f"Maximum: **{max_end.strftime('%Y-%m-%d')}** ({MAX_YEARS_AHEAD}-year limit)."
         )
     return None
 
@@ -1066,6 +1099,11 @@ async def cleanup_timer(channel_id: str, reason: str = "unknown", guild=None) ->
     # deferred_ops cascade-deletes via FK, but call explicitly to be safe
     try:
         await db_delete_deferred_ops(channel_id)
+    except Exception:
+        pass
+    # cancel any pending scheduled updates for this timer
+    try:
+        await db_cancel_scheduled_updates(channel_id)
     except Exception:
         pass
     await db_delete_timer(channel_id)
@@ -1512,14 +1550,16 @@ async def scheduled_timer_loop() -> None:
             jobs = await db_all_scheduled_timers()
 
             for job in jobs:
-                guild_id = int(job["guild_id"])
+                guild_id  = int(job["guild_id"])
+                op_type   = job["op_type"] if "op_type" in job.keys() else "create_timer"
+                create_at = datetime.fromisoformat(job["create_at"])
+
+                if create_at > now:
+                    continue   # not yet
+
                 if not is_guild_allowed(guild_id):
                     await db_mark_scheduled_executed(job["id"])
                     continue
-
-                create_at = datetime.fromisoformat(job["create_at"])
-                if create_at > now:
-                    continue   # not yet
 
                 end_time = datetime.fromisoformat(job["end_time"])
                 err      = validate_end_time(end_time)
@@ -1532,7 +1572,7 @@ async def scheduled_timer_loop() -> None:
 
                 if err:
                     await audit_log(
-                        action="SCHEDULED TIMER — SKIPPED (end in past)",
+                        action=f"SCHEDULED {op_type.upper()} — SKIPPED (end in past)",
                         result="warn",
                         detail=f"name={job['name']}  end_time={job['end_time']}",
                     )
@@ -1541,50 +1581,17 @@ async def scheduled_timer_loop() -> None:
                 guild = get_bot().get_guild(guild_id)
                 if not guild:
                     await audit_log(
-                        action="SCHEDULED TIMER — SKIPPED (guild not found)",
+                        action=f"SCHEDULED {op_type.upper()} — SKIPPED (guild not found)",
                         result="warn",
                         detail=f"guild_id={guild_id}  name={job['name']}",
                     )
                     continue
 
-                channel_name = format_timer_channel_name(job["name"], end_time)
-                overwrites   = {
-                    guild.default_role: discord.PermissionOverwrite(
-                        view_channel=True, connect=False
-                    ),
-                    guild.me: discord.PermissionOverwrite(view_channel=True, connect=True),
-                }
-                try:
-                    ch = await guild.create_voice_channel(
-                        name=channel_name, overwrites=overwrites
-                    )
-                except Exception as e:
-                    await log_error("scheduled_timer_loop/create_channel", e,
-                                    f"name={job['name']}")
-                    continue
-
-                try:
-                    await db_upsert_timer(str(ch.id), job["name"], job["end_time"])
-                except DBDiskFullError:
-                    await safe_channel_delete(ch)
-                    await audit_log(
-                        action="SCHEDULED TIMER — DB FULL",
-                        result="error",
-                        detail=f"name={job['name']}  channel rolled back",
-                    )
-                    continue
-
-                start_timer_task(str(ch.id))
-                ts = int(end_time.timestamp())
-                await audit_log(
-                    action="SCHEDULED TIMER — CREATED",
-                    guild=guild,
-                    target_channel=ch,
-                    detail=f"name={job['name']}  end=<t:{ts}:F>",
-                )
-                await send_timer_log(
-                    "📅 SCHEDULED TIMER CREATED", job["name"], end_time, channel=ch
-                )
+                # ── Dispatch by op_type ───────────────────────────────
+                if op_type == "update_timer":
+                    await _execute_scheduled_update(job, guild, end_time)
+                else:
+                    await _execute_scheduled_create(job, guild, end_time)
 
         except asyncio.CancelledError:
             return
@@ -1592,6 +1599,99 @@ async def scheduled_timer_loop() -> None:
             await log_error("scheduled_timer_loop", e)
 
         await asyncio.sleep(30)
+
+
+async def _execute_scheduled_create(job, guild, end_time: datetime) -> None:
+    """Create a voice channel timer from a scheduled_timers job."""
+    channel_name = format_timer_channel_name(job["name"], end_time)
+    overwrites   = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True, connect=False
+        ),
+        guild.me: discord.PermissionOverwrite(view_channel=True, connect=True),
+    }
+    try:
+        ch = await guild.create_voice_channel(
+            name=channel_name, overwrites=overwrites
+        )
+    except Exception as e:
+        await log_error("_execute_scheduled_create/create_channel", e,
+                        f"name={job['name']}")
+        return
+
+    try:
+        await db_upsert_timer(str(ch.id), job["name"], job["end_time"])
+    except DBDiskFullError:
+        await safe_channel_delete(ch)
+        await audit_log(
+            action="SCHEDULED CREATE — DB FULL",
+            result="error",
+            detail=f"name={job['name']}  channel rolled back",
+        )
+        return
+
+    start_timer_task(str(ch.id))
+    ts = int(end_time.timestamp())
+    await audit_log(
+        action="SCHEDULED TIMER — CREATED",
+        guild=guild,
+        target_channel=ch,
+        detail=f"name={job['name']}  end=<t:{ts}:F>",
+    )
+    await send_timer_log(
+        "📅 SCHEDULED TIMER CREATED", job["name"], end_time, channel=ch
+    )
+
+
+async def _execute_scheduled_update(job, guild, end_time: datetime) -> None:
+    """Apply a scheduled update to an existing timer."""
+    channel_id = job["channel_id"] if "channel_id" in job.keys() else None
+    if not channel_id:
+        await audit_log(
+            action="SCHEDULED UPDATE — SKIPPED (no channel_id)",
+            result="warn",
+            detail=f"name={job['name']}",
+        )
+        return
+
+    row = await db_get_timer(channel_id)
+    if not row:
+        # Timer was deleted before the scheduled update fired — silently discard
+        await audit_log(
+            action="SCHEDULED UPDATE — CANCELLED (timer deleted)",
+            result="warn",
+            detail=f"name={job['name']}  channel_id={channel_id}",
+        )
+        return
+
+    try:
+        await db_update_timer_field(
+            channel_id, name=job["name"], end_time=job["end_time"],
+            warned_1h=False, warned_12h=False,
+        )
+    except DBDiskFullError:
+        await audit_log(
+            action="SCHEDULED UPDATE — DB FULL",
+            result="error",
+            detail=f"name={job['name']}  channel_id={channel_id}",
+        )
+        return
+
+    ch = guild.get_channel(int(channel_id))
+    if ch:
+        await safe_channel_edit(ch, name=format_timer_channel_name(job["name"], end_time))
+
+    start_timer_task(channel_id)
+    ts = int(end_time.timestamp())
+    await audit_log(
+        action="SCHEDULED UPDATE — APPLIED",
+        guild=guild,
+        target_channel=ch,
+        detail=f"name={job['name']}  end=<t:{ts}:F>",
+    )
+    await send_timer_log(
+        "📅 SCHEDULED UPDATE APPLIED", job["name"], end_time, channel=ch
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1786,105 +1886,6 @@ class DeferChoiceView(discord.ui.View):
 
 
 # ════════════════════════════════════════════════════════════════════════
-# SCHEDULE TIMER MODAL
-# ════════════════════════════════════════════════════════════════════════
-
-class ScheduleTimerModal(discord.ui.Modal):
-    def __init__(self, session_id: str):
-        super().__init__(title="Schedule Timer Creation")
-        self.session_id  = session_id
-        self.name_input  = discord.ui.InputText(
-            label="Timer Name", placeholder="e.g. Season 4", required=True
-        )
-        self.cdate_input = discord.ui.InputText(
-            label="Create Date (YYYY-MM-DD, UTC)", placeholder="2026-07-01", required=True
-        )
-        self.ctime_input = discord.ui.InputText(
-            label="Create Time (HH:MM, UTC 24h)", placeholder="12:00", required=True
-        )
-        self.edate_input = discord.ui.InputText(
-            label="End Date (YYYY-MM-DD, UTC)", placeholder="2026-07-08", required=True
-        )
-        self.etime_input = discord.ui.InputText(
-            label="End Time (HH:MM, UTC 24h)", placeholder="18:00", required=True
-        )
-        self.add_item(self.name_input)
-        self.add_item(self.cdate_input)
-        self.add_item(self.ctime_input)
-        self.add_item(self.edate_input)
-        self.add_item(self.etime_input)
-
-    async def callback(self, itx: discord.Interaction):
-        if not validate_session(itx.guild.id, itx.user.id, self.session_id):
-            return await ix.reply_session_expired(itx)
-        touch_session(itx.guild.id, itx.user.id, self.session_id)
-
-        try:
-            create_at = datetime.fromisoformat(
-                f"{self.cdate_input.value}T{self.ctime_input.value}:00"
-            ).replace(tzinfo=timezone.utc)
-        except ValueError:
-            return await ix.safe_modal_response(
-                itx, "Invalid create date/time.\nDate: `YYYY-MM-DD`   Time: `HH:MM`"
-            )
-
-        try:
-            end_time = datetime.fromisoformat(
-                f"{self.edate_input.value}T{self.etime_input.value}:00"
-            ).replace(tzinfo=timezone.utc)
-        except ValueError:
-            return await ix.safe_modal_response(
-                itx, "Invalid end date/time.\nDate: `YYYY-MM-DD`   Time: `HH:MM`"
-            )
-
-        now = datetime.now(timezone.utc)
-        if create_at <= now:
-            return await ix.safe_modal_response(
-                itx, "The creation time is in the past. Please enter a future time."
-            )
-
-        err = validate_end_time(end_time)
-        if err:
-            return await ix.safe_modal_response(itx, err)
-
-        if end_time <= create_at:
-            return await ix.safe_modal_response(
-                itx, "The timer end must be **after** the creation time."
-            )
-
-        try:
-            await db_add_scheduled_timer(
-                itx.guild.id, self.name_input.value,
-                create_at.isoformat(), end_time.isoformat(),
-            )
-        except DBDiskFullError:
-            return await ix.safe_modal_response(
-                itx,
-                "Database is full — schedule could not be saved.\n"
-                "Free up disk space and try again.",
-            )
-
-        cts = int(create_at.timestamp())
-        ets = int(end_time.timestamp())
-        await ix.safe_modal_response(
-            itx,
-            f"Timer **{self.name_input.value}** scheduled.\n"
-            f"Creates: <t:{cts}:F> (<t:{cts}:R>)\n"
-            f"Expires: <t:{ets}:F>",
-        )
-        await audit_log(
-            action="SCHEDULE TIMER", guild=itx.guild, user=itx.user,
-            detail=(
-                f"name={self.name_input.value}"
-                f"  create=<t:{cts}:F>"
-                f"  end=<t:{ets}:F>"
-            ),
-            session_id=self.session_id,
-        )
-        await refresh_panel(itx, self.session_id)
-
-
-# ════════════════════════════════════════════════════════════════════════
 # TIMEZONE CONVERTER
 # ════════════════════════════════════════════════════════════════════════
 
@@ -1951,40 +1952,138 @@ class TimezoneConvertModal(discord.ui.Modal):
 # ════════════════════════════════════════════════════════════════════════
 
 class CreateTimerModal(discord.ui.Modal):
+    """
+    Creates a timer immediately, or schedules its creation for later.
+
+    Fields:
+      - Name           (required)
+      - End Date       (required, UTC)
+      - End Time       (required, UTC)
+      - Schedule Date  (optional, UTC) — if provided, defer creation to this time
+      - Schedule Time  (optional, UTC)
+
+    If schedule fields are blank → create immediately (existing behaviour).
+    If schedule fields are filled → store in scheduled_timers, create later.
+    """
     def __init__(self, session_id: str):
         super().__init__(title="Create Timer")
-        self.session_id = session_id
-        self.name_input = discord.ui.InputText(
-            label="Name", placeholder="e.g. Season 3", required=True
+        self.session_id    = session_id
+        self.name_input    = discord.ui.InputText(
+            label=f"Name (max {MAX_NAME_LENGTH} chars)",
+            placeholder="e.g. Season 3",
+            max_length=MAX_NAME_LENGTH,
+            required=True,
         )
-        self.date_input = discord.ui.InputText(
-            label="Date (YYYY-MM-DD, UTC)", placeholder="2026-06-01", required=True
+        self.edate_input   = discord.ui.InputText(
+            label="End Date (YYYY-MM-DD, UTC)", placeholder="2026-06-01", required=True
         )
-        self.time_input = discord.ui.InputText(
-            label="Time (HH:MM, UTC 24h)", placeholder="18:30", required=True
+        self.etime_input   = discord.ui.InputText(
+            label="End Time (HH:MM, UTC 24h)", placeholder="18:30", required=True
+        )
+        self.sdate_input   = discord.ui.InputText(
+            label="Schedule Date (YYYY-MM-DD, optional)", placeholder="Leave blank to create now",
+            required=False,
+        )
+        self.stime_input   = discord.ui.InputText(
+            label="Schedule Time (HH:MM, optional)", placeholder="Leave blank to create now",
+            required=False,
         )
         self.add_item(self.name_input)
-        self.add_item(self.date_input)
-        self.add_item(self.time_input)
+        self.add_item(self.edate_input)
+        self.add_item(self.etime_input)
+        self.add_item(self.sdate_input)
+        self.add_item(self.stime_input)
 
     async def callback(self, itx: discord.Interaction):
         if not validate_session(itx.guild.id, itx.user.id, self.session_id):
             return await ix.reply_session_expired(itx)
         touch_session(itx.guild.id, itx.user.id, self.session_id)
 
+        # ── Name validation ───────────────────────────────────────────
+        name_err = validate_timer_name(self.name_input.value)
+        if name_err:
+            return await ix.safe_modal_response(itx, name_err)
+
+        # ── End time ──────────────────────────────────────────────────
         try:
             end = datetime.fromisoformat(
-                f"{self.date_input.value}T{self.time_input.value}:00"
+                f"{self.edate_input.value}T{self.etime_input.value}:00"
             ).replace(tzinfo=timezone.utc)
         except ValueError:
             return await ix.safe_modal_response(
-                itx, "Invalid format.\nDate: `YYYY-MM-DD`   Time: `HH:MM`"
+                itx, "Invalid end date/time.\nDate: `YYYY-MM-DD`   Time: `HH:MM`"
             )
 
-        err = validate_end_time(end)
-        if err:
-            return await ix.safe_modal_response(itx, err)
+        end_err = validate_end_time(end)
+        if end_err:
+            return await ix.safe_modal_response(itx, end_err)
 
+        # ── Optional schedule time ─────────────────────────────────────
+        sdate = self.sdate_input.value.strip()
+        stime = self.stime_input.value.strip()
+        has_schedule = bool(sdate or stime)
+
+        if has_schedule:
+            if not sdate or not stime:
+                return await ix.safe_modal_response(
+                    itx,
+                    "Both **Schedule Date** and **Schedule Time** must be provided together.\n"
+                    "Leave both blank to create immediately.",
+                )
+            try:
+                create_at = datetime.fromisoformat(
+                    f"{sdate}T{stime}:00"
+                ).replace(tzinfo=timezone.utc)
+            except ValueError:
+                return await ix.safe_modal_response(
+                    itx, "Invalid schedule date/time.\nDate: `YYYY-MM-DD`   Time: `HH:MM`"
+                )
+
+            now = datetime.now(timezone.utc)
+            if create_at <= now:
+                return await ix.safe_modal_response(
+                    itx, "The schedule time is in the past. Please enter a future time."
+                )
+            if create_at >= end:
+                return await ix.safe_modal_response(
+                    itx, "The schedule time must be **before** the timer end time."
+                )
+
+            # Scheduled path
+            try:
+                await db_add_scheduled_timer(
+                    itx.guild.id, self.name_input.value,
+                    create_at.isoformat(), end.isoformat(),
+                    op_type="create_timer",
+                )
+            except DBDiskFullError:
+                return await ix.safe_modal_response(
+                    itx,
+                    "Database is full — schedule could not be saved.\n"
+                    "Free up disk space and try again.",
+                )
+
+            cts = int(create_at.timestamp())
+            ets = int(end.timestamp())
+            await ix.safe_modal_response(
+                itx,
+                f"Timer **{self.name_input.value}** scheduled.\n"
+                f"Creates: <t:{cts}:F> (<t:{cts}:R>)\n"
+                f"Expires: <t:{ets}:F>",
+            )
+            await audit_log(
+                action="CREATE TIMER — SCHEDULED", guild=itx.guild, user=itx.user,
+                detail=(
+                    f"name={self.name_input.value}"
+                    f"  create=<t:{cts}:F>"
+                    f"  end=<t:{ets}:F>"
+                ),
+                session_id=self.session_id,
+            )
+            await refresh_panel(itx, self.session_id)
+            return
+
+        # ── Immediate path ────────────────────────────────────────────
         channel_name = format_timer_channel_name(self.name_input.value, end)
         overwrites   = {
             itx.guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
@@ -2023,20 +2122,48 @@ class CreateTimerModal(discord.ui.Modal):
 
 
 class UpdateTimerModal(discord.ui.Modal):
+    """
+    Updates a timer immediately, or schedules the update for a specific time.
+
+    Fields:
+      - Name           (required)
+      - End Date       (required, UTC)
+      - End Time       (required, UTC)
+      - Schedule Date  (optional, UTC) — if provided, defer update to this time
+      - Schedule Time  (optional, UTC)
+
+    If schedule fields are blank → apply immediately.
+    If schedule fields are filled → store as a scheduled update_timer job.
+    Multiple pending updates for the same timer execute in chronological order.
+    """
     def __init__(self, channel_id: str, session_id: str):
         super().__init__(title="Update Timer")
-        self.channel_id = channel_id
-        self.session_id = session_id
-        self.name_input = discord.ui.InputText(label="Name", required=True)
-        self.date_input = discord.ui.InputText(
-            label="Date (YYYY-MM-DD, UTC)", placeholder="2026-06-01", required=True
+        self.channel_id    = channel_id
+        self.session_id    = session_id
+        self.name_input    = discord.ui.InputText(
+            label=f"Name (max {MAX_NAME_LENGTH} chars)",
+            max_length=MAX_NAME_LENGTH,
+            required=True,
         )
-        self.time_input = discord.ui.InputText(
-            label="Time (HH:MM, UTC 24h)", placeholder="18:30", required=True
+        self.edate_input   = discord.ui.InputText(
+            label="End Date (YYYY-MM-DD, UTC)", placeholder="2026-06-01", required=True
+        )
+        self.etime_input   = discord.ui.InputText(
+            label="End Time (HH:MM, UTC 24h)", placeholder="18:30", required=True
+        )
+        self.sdate_input   = discord.ui.InputText(
+            label="Schedule Date (YYYY-MM-DD, optional)", placeholder="Leave blank to apply now",
+            required=False,
+        )
+        self.stime_input   = discord.ui.InputText(
+            label="Schedule Time (HH:MM, optional)", placeholder="Leave blank to apply now",
+            required=False,
         )
         self.add_item(self.name_input)
-        self.add_item(self.date_input)
-        self.add_item(self.time_input)
+        self.add_item(self.edate_input)
+        self.add_item(self.etime_input)
+        self.add_item(self.sdate_input)
+        self.add_item(self.stime_input)
 
     async def callback(self, itx: discord.Interaction):
         if not validate_session(itx.guild.id, itx.user.id, self.session_id):
@@ -2048,48 +2175,118 @@ class UpdateTimerModal(discord.ui.Modal):
             return await ix.reply_debounce(itx)
 
         try:
+            # ── Name validation ───────────────────────────────────────
+            name_err = validate_timer_name(self.name_input.value)
+            if name_err:
+                return await ix.safe_modal_response(itx, name_err)
+
+            # ── End time ──────────────────────────────────────────────
             try:
                 end = datetime.fromisoformat(
-                    f"{self.date_input.value}T{self.time_input.value}:00"
+                    f"{self.edate_input.value}T{self.etime_input.value}:00"
                 ).replace(tzinfo=timezone.utc)
             except ValueError:
                 return await ix.safe_modal_response(
-                    itx, "Invalid format.\nDate: `YYYY-MM-DD`   Time: `HH:MM`"
+                    itx, "Invalid end date/time.\nDate: `YYYY-MM-DD`   Time: `HH:MM`"
                 )
 
-            err = validate_end_time(end)
-            if err:
-                return await ix.safe_modal_response(itx, err)
+            end_err = validate_end_time(end)
+            if end_err:
+                return await ix.safe_modal_response(itx, end_err)
 
             row = await db_get_timer(self.channel_id)
             if not row:
                 return await ix.safe_modal_response(itx, "Timer no longer exists.")
 
-            ts = int(end.timestamp())
+            # ── Optional schedule time ────────────────────────────────
+            sdate = self.sdate_input.value.strip()
+            stime = self.stime_input.value.strip()
+            has_schedule = bool(sdate or stime)
 
-            # ── Defer choice ─────────────────────────────────────────
-            defer_view = DeferChoiceView()
+            if has_schedule:
+                if not sdate or not stime:
+                    return await ix.safe_modal_response(
+                        itx,
+                        "Both **Schedule Date** and **Schedule Time** must be provided together.\n"
+                        "Leave both blank to apply immediately.",
+                    )
+                try:
+                    schedule_at = datetime.fromisoformat(
+                        f"{sdate}T{stime}:00"
+                    ).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    return await ix.safe_modal_response(
+                        itx, "Invalid schedule date/time.\nDate: `YYYY-MM-DD`   Time: `HH:MM`"
+                    )
+
+                now = datetime.now(timezone.utc)
+                if schedule_at <= now:
+                    return await ix.safe_modal_response(
+                        itx, "The schedule time is in the past. Please enter a future time."
+                    )
+                if schedule_at >= end:
+                    return await ix.safe_modal_response(
+                        itx, "The schedule time must be **before** the new timer end time."
+                    )
+
+                # Confirm before scheduling
+                confirm_view = ConfirmView()
+                ts = int(end.timestamp())
+                sts = int(schedule_at.timestamp())
+                await ix.safe_modal_response(
+                    itx,
+                    content=(
+                        f"Schedule update for **{row['name']}**?\n"
+                        f"New name: **{self.name_input.value}**\n"
+                        f"New end: <t:{ts}:F>\n"
+                        f"Applies at: <t:{sts}:F> (<t:{sts}:R>)"
+                    ),
+                    view=confirm_view,
+                )
+                await confirm_view.wait()
+                if not confirm_view.confirmed:
+                    return
+                if not validate_session(itx.guild.id, itx.user.id, self.session_id):
+                    return await ix.safe_followup(itx, "Session expired during confirmation.")
+
+                try:
+                    await db_add_scheduled_timer(
+                        itx.guild.id, self.name_input.value,
+                        schedule_at.isoformat(), end.isoformat(),
+                        op_type="update_timer",
+                        channel_id=self.channel_id,
+                    )
+                except DBDiskFullError:
+                    return await ix.safe_followup(
+                        itx, "Database is full — scheduled update could not be saved."
+                    )
+
+                await ix.safe_followup(
+                    itx,
+                    f"Update scheduled for **{row['name']}**.\n"
+                    f"Will apply at <t:{sts}:F> (<t:{sts}:R>).",
+                )
+                await audit_log(
+                    action="UPDATE TIMER — SCHEDULED", guild=itx.guild, user=itx.user,
+                    detail=(
+                        f"new_name={self.name_input.value}"
+                        f"  new_end=<t:{ts}:F>"
+                        f"  schedule=<t:{sts}:F>"
+                    ),
+                    session_id=self.session_id,
+                )
+                await refresh_panel(itx, self.session_id)
+                return
+
+            # ── Immediate path ────────────────────────────────────────
+            ts = int(end.timestamp())
+            confirm_view = ConfirmView()
             await ix.safe_modal_response(
                 itx,
                 content=(
                     f"Update **{row['name']}** → **{self.name_input.value}**\n"
-                    f"New end: <t:{ts}:F> (<t:{ts}:R>)\n\nWhen should this apply?"
+                    f"New end: <t:{ts}:F> (<t:{ts}:R>)"
                 ),
-                view=defer_view,
-            )
-            await defer_view.wait()
-            if defer_view.choice is None:
-                return
-
-            if not validate_session(itx.guild.id, itx.user.id, self.session_id):
-                return await ix.safe_followup(itx, "Session expired.")
-
-            # ── Confirm ──────────────────────────────────────────────
-            confirm_view = ConfirmView()
-            mode_label   = "immediately" if defer_view.choice == "immediate" else "when timer ends"
-            await ix.safe_followup(
-                itx,
-                content=f"Confirm update **{self.name_input.value}** — {mode_label}?",
                 view=confirm_view,
             )
             await confirm_view.wait()
@@ -2099,58 +2296,33 @@ class UpdateTimerModal(discord.ui.Modal):
             if not validate_session(itx.guild.id, itx.user.id, self.session_id):
                 return await ix.safe_followup(itx, "Session expired during confirmation.")
 
-            if defer_view.choice == "immediate":
-                try:
-                    await db_update_timer_field(
-                        self.channel_id, name=self.name_input.value,
-                        end_time=end.isoformat(), warned_1h=False, warned_12h=False,
-                    )
-                except DBDiskFullError:
-                    return await ix.safe_followup(
-                        itx,
-                        "Database is full — update could not be saved.\n"
-                        "The timer was not changed.",
-                    )
-                start_timer_task(self.channel_id)
-                ch = itx.guild.get_channel(int(self.channel_id))
-                if ch:
-                    await safe_channel_edit(
-                        ch, name=format_timer_channel_name(self.name_input.value, end)
-                    )
-                await ix.safe_followup(
+            try:
+                await db_update_timer_field(
+                    self.channel_id, name=self.name_input.value,
+                    end_time=end.isoformat(), warned_1h=False, warned_12h=False,
+                )
+            except DBDiskFullError:
+                return await ix.safe_followup(
                     itx,
-                    f"Timer **{self.name_input.value}** updated.\nNew end: <t:{ts}:F> (<t:{ts}:R>)",
+                    "Database is full — update could not be saved.\n"
+                    "The timer was not changed.",
                 )
-                await audit_log(
-                    action="UPDATE TIMER", guild=itx.guild, user=itx.user,
-                    target_channel=itx.guild.get_channel(int(self.channel_id)),
-                    detail=f"new_end=<t:{ts}:F>",
-                    session_id=self.session_id,
+            start_timer_task(self.channel_id)
+            ch = itx.guild.get_channel(int(self.channel_id))
+            if ch:
+                await safe_channel_edit(
+                    ch, name=format_timer_channel_name(self.name_input.value, end)
                 )
-            else:
-                try:
-                    await db_add_deferred_op(
-                        self.channel_id, "update",
-                        {"name": self.name_input.value, "end_time": end.isoformat()},
-                    )
-                except DBDiskFullError:
-                    return await ix.safe_followup(
-                        itx, "Database is full — deferred update could not be queued."
-                    )
-                await ix.safe_followup(
-                    itx,
-                    f"Update queued for **{row['name']}**.\n"
-                    f"Will apply when the timer expires.",
-                )
-                await audit_log(
-                    action="UPDATE TIMER — DEFERRED", guild=itx.guild, user=itx.user,
-                    detail=(
-                        f"new_name={self.name_input.value}  "
-                        f"new_end=<t:{ts}:F>"
-                    ),
-                    session_id=self.session_id,
-                )
-
+            await ix.safe_followup(
+                itx,
+                f"Timer **{self.name_input.value}** updated.\nNew end: <t:{ts}:F> (<t:{ts}:R>)",
+            )
+            await audit_log(
+                action="UPDATE TIMER", guild=itx.guild, user=itx.user,
+                target_channel=itx.guild.get_channel(int(self.channel_id)),
+                detail=f"new_end=<t:{ts}:F>",
+                session_id=self.session_id,
+            )
             await refresh_panel(itx, self.session_id)
         finally:
             _debounce_release(itx.guild.id, dkey)
@@ -2507,26 +2679,10 @@ class AdminPanelView(discord.ui.View):
             return await ix.reply_debounce(itx)
 
         try:
-            # ── Defer choice ─────────────────────────────────────────
-            defer_view = DeferChoiceView()
+            confirm_view = ConfirmView()
             await ix.safe_send_response(
                 itx,
-                content=f"Delete **{row['name']}**?\nWhen should this apply?",
-                view=defer_view,
-            )
-            await defer_view.wait()
-            if defer_view.choice is None:
-                return
-
-            if not validate_session(itx.guild.id, itx.user.id, self.session_id):
-                return await ix.safe_followup(itx, "Session expired.")
-
-            # ── Confirm ──────────────────────────────────────────────
-            confirm_view = ConfirmView()
-            mode_label   = "immediately" if defer_view.choice == "immediate" else "when timer ends"
-            await ix.safe_followup(
-                itx,
-                content=f"Confirm delete **{row['name']}** — {mode_label}? This cannot be undone.",
+                content=f"Delete **{row['name']}**? This cannot be undone.",
                 view=confirm_view,
             )
             await confirm_view.wait()
@@ -2536,57 +2692,39 @@ class AdminPanelView(discord.ui.View):
             if not validate_session(itx.guild.id, itx.user.id, self.session_id):
                 return await ix.safe_followup(itx, "Session expired during confirmation.")
 
-            if defer_view.choice == "immediate":
-                ch  = itx.guild.get_channel(int(cid))
-                old = TIMER_TASKS.pop(cid, None)
-                if old:
-                    old.cancel()
+            ch  = itx.guild.get_channel(int(cid))
+            old = TIMER_TASKS.pop(cid, None)
+            if old:
+                old.cancel()
 
-                try:
-                    await db_delete_deferred_ops(cid)
-                    await db_delete_timer(cid)
-                except DBDiskFullError:
-                    start_timer_task(cid)
-                    return await ix.safe_followup(
-                        itx,
-                        "Database is full — timer record could not be deleted.\n"
-                        "The Discord channel was not deleted.",
-                    )
-
-                stale = [k for k, v in list(CURRENT_SELECTION.items()) if v == cid]
-                for k in stale:
-                    CURRENT_SELECTION.pop(k, None)
-
-                if ch:
-                    await safe_channel_delete(ch)
-                    await ix.safe_followup(itx, f"**{row['name']}** deleted.")
-                else:
-                    await ix.safe_followup(
-                        itx, "Timer removed from database (channel was already gone)."
-                    )
-                await audit_log(
-                    action="DELETE TIMER", guild=itx.guild, user=itx.user,
-                    target_channel=ch or cid, detail=f"name={row['name']}",
-                    session_id=self.session_id,
-                )
-            else:
-                try:
-                    await db_add_deferred_op(cid, "delete", {})
-                except DBDiskFullError:
-                    return await ix.safe_followup(
-                        itx, "Database is full — deferred delete could not be queued."
-                    )
-                await ix.safe_followup(
+            try:
+                await db_delete_deferred_ops(cid)
+                await db_cancel_scheduled_updates(cid)
+                await db_delete_timer(cid)
+            except DBDiskFullError:
+                start_timer_task(cid)
+                return await ix.safe_followup(
                     itx,
-                    f"Delete queued for **{row['name']}**.\n"
-                    "The timer will run normally and be deleted when it expires.",
-                )
-                await audit_log(
-                    action="DELETE TIMER — DEFERRED", guild=itx.guild, user=itx.user,
-                    detail=f"name={row['name']}",
-                    session_id=self.session_id,
+                    "Database is full — timer record could not be deleted.\n"
+                    "The Discord channel was not deleted.",
                 )
 
+            stale = [k for k, v in list(CURRENT_SELECTION.items()) if v == cid]
+            for k in stale:
+                CURRENT_SELECTION.pop(k, None)
+
+            if ch:
+                await safe_channel_delete(ch)
+                await ix.safe_followup(itx, f"**{row['name']}** deleted.")
+            else:
+                await ix.safe_followup(
+                    itx, "Timer removed from database (channel was already gone)."
+                )
+            await audit_log(
+                action="DELETE TIMER", guild=itx.guild, user=itx.user,
+                target_channel=ch or cid, detail=f"name={row['name']}",
+                session_id=self.session_id,
+            )
             await refresh_panel(itx, self.session_id)
         finally:
             _debounce_release(itx.guild.id, dkey)
@@ -2654,13 +2792,6 @@ class AdminPanelView(discord.ui.View):
         finally:
             _debounce_release(itx.guild.id, dkey)
 
-    # ── 📅 Schedule ──────────────────────────────────────────────────
-    @discord.ui.button(emoji="📅", style=discord.ButtonStyle.secondary, custom_id="panel_schedule")
-    async def btn_schedule(self, btn, itx: discord.Interaction):
-        if not self._auth(itx):
-            return await ix.reply_session_expired(itx)
-        await ix.safe_send_modal(itx, ScheduleTimerModal(self.session_id))
-
     # ── 📊 Overview ──────────────────────────────────────────────────
     @discord.ui.button(emoji="📊", style=discord.ButtonStyle.secondary, custom_id="panel_view")
     async def btn_view(self, btn, itx: discord.Interaction):
@@ -2691,11 +2822,7 @@ class AdminPanelView(discord.ui.View):
                     end    = datetime.fromisoformat(row["end_time"])
                     ts     = int(end.timestamp())
                     ops    = await db_get_deferred_ops(row["channel_id"])
-                    badges = ""
-                    if any(o["op_type"] == "delete" for o in ops):
-                        badges += " ⏳🗑"
-                    elif ops:
-                        badges += " ⏳"
+                    badges = " ⏳" if ops else ""
                     c.add_text(f"**{row['name']}**{badges}  —  <t:{ts}:R>  (<t:{ts}:F>)")
                 except Exception:
                     pass
@@ -2727,20 +2854,28 @@ class AdminPanelView(discord.ui.View):
             c_empty.add_text("No timers.")
             v.add_item(c_empty)
 
-        # ── Scheduled timers ─────────────────────────────────────────
+        # ── Scheduled jobs ────────────────────────────────────────────
         if scheduled:
             cs = discord.ui.Container(color=discord.Color.teal())
-            cs.add_text("**Scheduled Creations**")
+            cs.add_text("**Scheduled Jobs**")
             cs.add_separator(divider=True)
             for job in scheduled:
                 try:
+                    op_type = job["op_type"] if "op_type" in job.keys() else "create_timer"
                     cts = int(datetime.fromisoformat(job["create_at"]).timestamp())
                     ets = int(datetime.fromisoformat(job["end_time"]).timestamp())
-                    cs.add_text(
-                        f"📅 **{job['name']}**\n"
-                        f"Creates: <t:{cts}:F> (<t:{cts}:R>)\n"
-                        f"Expires: <t:{ets}:F>"
-                    )
+                    if op_type == "update_timer":
+                        cs.add_text(
+                            f"✏ **{job['name']}** (update)\n"
+                            f"Applies: <t:{cts}:F> (<t:{cts}:R>)\n"
+                            f"New end: <t:{ets}:F>"
+                        )
+                    else:
+                        cs.add_text(
+                            f"📅 **{job['name']}** (create)\n"
+                            f"Creates: <t:{cts}:F> (<t:{cts}:R>)\n"
+                            f"Expires: <t:{ets}:F>"
+                        )
                 except Exception:
                     pass
             v.add_item(cs)
@@ -2935,12 +3070,11 @@ async def _build_panel_view(guild, session_id: str) -> discord.ui.DesignerView:
 
     # Controls reference — one line per button
     header.add_text(
-        "➕  Create timer\n"
-        "✏  Update selected\n"
+        "➕  Create timer (or schedule)\n"
+        "✏  Update selected (or schedule)\n"
         "🗑  Delete selected\n"
         "⏳  Extend selected\n"
         "🏁  End Mode selected\n"
-        "📅  Schedule future timer\n"
         "📊  Overview\n"
         "🏆  Tournament\n"
         "🌐  Timezone\n"
@@ -2956,21 +3090,19 @@ async def _build_panel_view(guild, session_id: str) -> discord.ui.DesignerView:
     view.add_item(dropdown_row)
 
     # ── Action buttons (emoji-only)
-    # Row layout: ➕ ✏ 🗑  |  ⏳ 🏁 📅  |  📊 🏆 🌐  |  🔒
+    # Row layout: ➕ ✏ 🗑  |  ⏳ 🏁 📊  |  🏆 🌐 🔒
     apv     = AdminPanelView(guild, session_id)
     buttons = apv.children
     # buttons order defined by @discord.ui.button declarations:
-    # 0=➕  1=✏  2=🗑  3=⏳  4=🏁  5=📅  6=📊  7=🏆  8=🌐  9=🔒
+    # 0=➕  1=✏  2=🗑  3=⏳  4=🏁  5=📊  6=🏆  7=🌐  8=🔒
 
     row1 = discord.ui.ActionRow(buttons[0], buttons[1], buttons[2])   # ➕ ✏ 🗑
-    row2 = discord.ui.ActionRow(buttons[3], buttons[4], buttons[5])   # ⏳ 🏁 📅
-    row3 = discord.ui.ActionRow(buttons[6], buttons[7], buttons[8])   # 📊 🏆 🌐
-    row4 = discord.ui.ActionRow(buttons[9])                            # 🔒
+    row2 = discord.ui.ActionRow(buttons[3], buttons[4], buttons[5])   # ⏳ 🏁 📊
+    row3 = discord.ui.ActionRow(buttons[6], buttons[7], buttons[8])   # 🏆 🌐 🔒
 
     view.add_item(row1)
     view.add_item(row2)
     view.add_item(row3)
-    view.add_item(row4)
 
     return view
 
@@ -3069,16 +3201,28 @@ async def startup_integrity_check() -> None:
         except Exception as e:
             print(f"[Startup] Tournament restore error for #{ch.name}: {e}")
 
-    # Scheduled timers — evict any that have already passed their end_time
-    # (create_at already passed handled by scheduled_timer_loop)
+    # Scheduled jobs — evict expired and orphaned update jobs
     now = datetime.now(timezone.utc)
     for job in await db_all_scheduled_timers():
         try:
+            op_type  = job["op_type"] if "op_type" in job.keys() else "create_timer"
             end_time = datetime.fromisoformat(job["end_time"])
+
             if end_time <= now:
-                print(f"[Startup] Scheduled timer expired before creation, removing: {job['id']}")
+                print(f"[Startup] Scheduled job expired before execution, removing: id={job['id']}")
                 await db_mark_scheduled_executed(job["id"])
+                continue
+
+            if op_type == "update_timer":
+                cid = job["channel_id"] if "channel_id" in job.keys() else None
+                if cid:
+                    row = await db_get_timer(cid)
+                    if not row:
+                        print(
+                            f"[Startup] Scheduled update has no timer, cancelling: id={job['id']}"
+                        )
+                        await db_mark_scheduled_executed(job["id"])
         except Exception as e:
-            print(f"[Startup] Scheduled timer check error for id={job['id']}: {e}")
+            print(f"[Startup] Scheduled job check error for id={job['id']}: {e}")
 
     print("[Startup] Integrity check complete.")
