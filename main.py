@@ -37,6 +37,11 @@ async def cmd_timerpanel(ctx):
     await tm.cmd_timerpanel_handler(ctx)
 
 
+@bot.slash_command(name="help", description="Open the interactive documentation panel")
+async def cmd_help(ctx):
+    await tm.cmd_help_handler(ctx)
+
+
 # ── Lifecycle ─────────────────────────────────────────────────────────
 
 @bot.event
