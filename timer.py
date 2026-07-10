@@ -55,8 +55,8 @@ SESSION_TIMEOUT_SECS  = 15 * 60   # 15 minutes of inactivity
 # Only guilds in this set may use the bot. Any other guild triggers an
 # immediate leave. Add your authorized guild IDs here.
 ALLOWED_GUILDS: set[int] = {
-    1452099895564439682,   # replace with actual guild IDs
-    1501512464557412395,
+    1485974710847013014,   # replace with actual guild IDs
+    1428800178848010331,
 }
 
 
@@ -223,6 +223,10 @@ _WAL_AUTOCHECKPOINT    = 500                 # pages (~2 MB at default page size
 _MAINTENANCE_INTERVAL_HOURS = 6
 _DISK_WARN_THRESHOLD_MB     = 200
 
+# Tracks the last maintenance alert state to suppress duplicate Discord logs.
+# Keys: "fingerprint" → tuple describing last alert sent.
+_MAINT_LAST_STATE: dict = {}
+
 
 class DBError(RuntimeError):
     """Base class for database layer errors."""
@@ -379,6 +383,24 @@ async def db_maintenance() -> dict:
 
 
 async def db_maintenance_loop() -> None:
+    """
+    Scheduled maintenance loop.
+
+    Discord logging policy
+    ──────────────────────
+    Healthy runs produce NO Discord output — only stdout.
+    A Discord log fires only when something changes:
+
+      Warning (yellow)  — first occurrence of low disk, VACUUM skipped, or
+                          a partially-failed checkpoint
+      Error   (red)     — hard errors (disk full, I/O failure, checkpoint
+                          failed entirely)
+      Resolved (green)  — sent once when a previously-warned condition clears
+
+    Repeating the same warning every cycle is suppressed via
+    _MAINT_LAST_STATE.  A new alert fires only when the severity
+    changes or the specific error text changes.
+    """
     await get_bot().wait_until_ready()
     await asyncio.sleep(60)   # let integrity check complete first
 
@@ -386,32 +408,92 @@ async def db_maintenance_loop() -> None:
         try:
             stats = await db_maintenance()
 
-            before_db  = stats["before"]["db"]  / (1024 * 1024)
-            before_wal = stats["before"]["wal"] / (1024 * 1024)
-            after_db   = stats["after"]["db"]   / (1024 * 1024)
-            after_wal  = stats["after"]["wal"]  / (1024 * 1024)
             free_mb    = stats["free_mb"]
+            before_wal = stats["before"]["wal"] / (1024 * 1024)
+            after_wal  = stats["after"]["wal"]  / (1024 * 1024)
+            errors     = stats["errors"]         # list[str] from db_maintenance()
 
-            result = "warn" if (stats["errors"] or (0 <= free_mb < _DISK_WARN_THRESHOLD_MB)) else "ok"
+            # ── Classify this run ─────────────────────────────────────
+            hard_errors = [e for e in errors
+                           if not e.startswith("VACUUM skipped")]
+            low_disk    = 0 <= free_mb < _DISK_WARN_THRESHOLD_MB
+            wal_large   = after_wal > 32   # MB
+            vac_skipped = any("VACUUM skipped" in e for e in errors)
 
-            lines = [
-                f"DB:  {before_db:.2f} MB → {after_db:.2f} MB",
-                f"WAL: {before_wal:.2f} MB → {after_wal:.2f} MB",
-                f"Free: {free_mb:.0f} MB",
-                f"Checkpoint {'✅' if stats['checkpoint'] else '❌'}  "
-                f"Truncate {'✅' if stats['truncate'] else '❌'}  "
-                f"VACUUM {'✅' if stats['vacuum'] else '❌'}",
-            ]
-            if stats["errors"]:
-                lines.append("Errors: " + " | ".join(stats["errors"]))
-            if 0 <= free_mb < _DISK_WARN_THRESHOLD_MB:
-                lines.append(f"⚠️ LOW DISK: {free_mb:.0f} MB free")
+            if hard_errors:
+                severity = "error"
+            elif low_disk or wal_large or (vac_skipped and not stats["checkpoint"]):
+                severity = "warn"
+            else:
+                severity = "ok"
 
-            await audit_log(
-                action="DB MAINTENANCE",
-                result=result,
-                detail="\n".join(lines),
+            # Build a compact fingerprint so we only re-alert on change
+            fingerprint = (
+                severity,
+                round(free_mb / 50) * 50 if low_disk else -1,   # bucket to ±50 MB
+                bool(hard_errors),
+                bool(wal_large),
             )
+
+            prev = _MAINT_LAST_STATE.get("fingerprint")
+            _MAINT_LAST_STATE["fingerprint"] = fingerprint
+
+            # Always print to stdout for server logs
+            db_mb  = stats["after"]["db"]  / (1024 * 1024)
+            wal_mb = stats["after"]["wal"] / (1024 * 1024)
+            print(
+                f"[Maintenance] OK — DB {db_mb:.2f} MB  WAL {wal_mb:.2f} MB  "
+                f"Free {free_mb:.0f} MB  "
+                f"chk={'✓' if stats['checkpoint'] else '✗'}  "
+                f"trunc={'✓' if stats['truncate'] else '✗'}  "
+                f"vac={'✓' if stats['vacuum'] else '✗'}"
+                + (f"  errors={errors}" if errors else "")
+            )
+
+            # ── Discord log only on state change ─────────────────────
+            if fingerprint == prev:
+                # Condition unchanged — skip Discord entirely
+                pass
+
+            elif severity == "ok" and prev is not None and prev[0] != "ok":
+                # Previously had a problem — send a one-time "resolved" log
+                await audit_log(
+                    action="DB MAINTENANCE — RESOLVED",
+                    result="ok",
+                    detail=(
+                        f"DB: {db_mb:.2f} MB  WAL: {wal_mb:.2f} MB  "
+                        f"Free: {free_mb:.0f} MB\n"
+                        "Previous condition has cleared."
+                    ),
+                )
+
+            elif severity == "warn":
+                lines = []
+                if low_disk:
+                    lines.append(f"⚠️ Low disk: **{free_mb:.0f} MB** free (threshold {_DISK_WARN_THRESHOLD_MB} MB)")
+                if wal_large:
+                    lines.append(f"⚠️ WAL file is large: **{after_wal:.1f} MB**")
+                if vac_skipped:
+                    vac_msg = next((e for e in errors if "VACUUM skipped" in e), "")
+                    lines.append(f"⚠️ VACUUM skipped — {vac_msg}")
+                if hard_errors:
+                    lines.extend(f"⚠️ {e}" for e in hard_errors)
+                lines.append(f"DB: {db_mb:.2f} MB  WAL: {wal_mb:.2f} MB  Free: {free_mb:.0f} MB")
+                await audit_log(
+                    action="DB MAINTENANCE — WARNING",
+                    result="warn",
+                    detail="\n".join(lines),
+                )
+
+            elif severity == "error":
+                lines = [f"❌ {e}" for e in hard_errors]
+                lines.append(f"DB: {db_mb:.2f} MB  WAL: {wal_mb:.2f} MB  Free: {free_mb:.0f} MB")
+                await audit_log(
+                    action="DB MAINTENANCE — ERROR",
+                    result="error",
+                    detail="\n".join(lines),
+                )
+
         except Exception as e:
             await log_error("db_maintenance_loop", e)
 
@@ -3159,6 +3241,498 @@ async def _build_panel_view(guild, session_id: str) -> discord.ui.DesignerView:
     view.add_item(row3)
 
     return view
+
+
+# ════════════════════════════════════════════════════════════════════════
+# HELP SYSTEM
+# Interactive documentation panel with category dropdown.
+# Each category renders as a DesignerView with structured containers.
+# ════════════════════════════════════════════════════════════════════════
+
+# ── Category definitions ──────────────────────────────────────────────
+# Each entry: (dropdown_label, emoji, short_description, content_key)
+_HELP_CATEGORIES: list[tuple[str, str, str]] = [
+    ("Timer Panel",       "🎛",  "All control panel buttons explained"),
+    ("Timer System",      "⏱",  "Reminders, End Mode, naming, limits"),
+    ("Schedule System",   "📅",  "Scheduling creation and updates"),
+    ("Tournament",        "🏆",  "Tournament channel management"),
+    ("Timezone Converter","🌐",  "Converting local times to UTC"),
+    ("Security",          "🔒",  "Sessions, whitelist, protection"),
+    ("FAQ",               "❓",  "Common questions and answers"),
+]
+
+# ── Help content ──────────────────────────────────────────────────────
+# Each value is a list of (title, body) section tuples rendered as
+# separate containers inside the DesignerView.
+_HELP_CONTENT: dict[str, list[tuple[str, str]]] = {
+
+    "Timer Panel": [
+        ("➕  Create Timer", (
+            "Opens a 5-field modal to create a new timer.\n\n"
+            "**Required fields**\n"
+            "— **Name** (max 30 characters)\n"
+            "— **End Date** — `YYYY-MM-DD` in UTC\n"
+            "— **End Time** — `HH:MM` in 24-hour UTC\n\n"
+            "**Optional fields** (leave blank to create immediately)\n"
+            "— **Schedule Date** — UTC date to create the voice channel\n"
+            "— **Schedule Time** — UTC time to create the voice channel\n\n"
+            "**Immediate creation** — both schedule fields blank:\n"
+            "A voice channel is created now and the countdown begins.\n\n"
+            "**Scheduled creation** — schedule fields filled:\n"
+            "No channel is created yet. The bot stores the job and "
+            "automatically creates the channel when the scheduled time arrives. "
+            "The channel then runs exactly like a manually created timer.\n\n"
+            "**Validation**\n"
+            "— End time must be in the future\n"
+            "— End time cannot exceed 2 years from now\n"
+            "— Schedule time must be before end time\n"
+            "— Schedule time must be in the future"
+        )),
+        ("✏  Update Timer", (
+            "Updates the name or end time of the selected timer.\n\n"
+            "Select a timer from the dropdown first, then press ✏.\n\n"
+            "**Fields** — same layout as Create Timer.\n\n"
+            "**Immediate update** — schedule fields blank:\n"
+            "Changes apply now. The countdown restarts. "
+            "Both reminder flags reset so the updated timer triggers fresh reminders.\n\n"
+            "**Scheduled update** — schedule fields filled:\n"
+            "The update is stored and applied automatically at the scheduled time. "
+            "The existing timer continues running unchanged until then. "
+            "Multiple scheduled updates for the same timer are safe and execute in "
+            "chronological order. If the timer is deleted before the update fires, "
+            "the queued update is automatically cancelled."
+        )),
+        ("🗑  Delete Timer", (
+            "Deletes the selected timer immediately.\n\n"
+            "Select a timer from the dropdown, then press 🗑.\n\n"
+            "A confirmation dialog appears showing the timer name. "
+            "Confirming deletes the database record, cancels the background task, "
+            "and deletes the Discord voice channel.\n\n"
+            "**Archived timers** (End Mode) can also be deleted this way. "
+            "The renamed ENDED channel will be permanently removed.\n\n"
+            "**Pending scheduled updates** for the timer are automatically "
+            "cancelled when the timer is deleted."
+        )),
+        ("⏳  Extend Timer", (
+            "Adds time to the selected timer.\n\n"
+            "Select a timer, press ⏳, then choose a duration:\n"
+            "— 1 Hour\n"
+            "— 1 Day\n"
+            "— 1 Week\n"
+            "— 1 Month (30 days)\n\n"
+            "**Apply Immediately** — the timer end time is extended right now. "
+            "Both reminder flags reset so warnings fire again at the new 12h and 1h marks.\n\n"
+            "**Apply When Timer Ends** — the extension is queued. "
+            "When the timer reaches zero, the extension is applied before deletion, "
+            "restarting the countdown from the new end time. "
+            "This effectively chains a new timer onto the end of the current one."
+        )),
+        ("🏁  End Mode", (
+            "Marks the selected timer to be archived instead of deleted when it expires.\n\n"
+            "**Normal behaviour** — when a timer reaches zero, the voice channel is deleted.\n\n"
+            "**End Mode** — when a timer reaches zero, the voice channel is renamed to "
+            "`⏲️ Name » ENDED` and preserved indefinitely. "
+            "The timer record is marked as ended in the database.\n\n"
+            "Archived timers remain visible in the server and in the Overview panel. "
+            "Delete them manually via 🗑 when no longer needed.\n\n"
+            "End Mode is a one-way toggle — once enabled it cannot be disabled. "
+            "Create a fresh timer if you need normal deletion behaviour."
+        )),
+        ("📊  Overview", (
+            "Opens a full dashboard showing the current state of all timers "
+            "and the tournament system.\n\n"
+            "**Sections shown**\n"
+            "— Active Timers — running timers with remaining time\n"
+            "— End Mode Timers — timers set to archive on expiry\n"
+            "— Archived Timers — timers that have ended and been preserved\n"
+            "— Scheduled Jobs — pending scheduled creations and updates\n"
+            "— Tournament — active channel and skip status\n"
+            "— Database — file sizes and free disk space\n\n"
+            "Active timers with a pending deferred extend show a ⏳ badge. "
+            "The Overview is ephemeral and only visible to you."
+        )),
+        ("🏆  Tournament", (
+            "Opens the tournament management sub-panel.\n\n"
+            "**➕ Create** — creates a new tournament channel with live schedule cards. "
+            "Only one tournament channel can exist per server at a time.\n\n"
+            "**🗑 Delete** — removes the active tournament channel and its database record. "
+            "Requires confirmation.\n\n"
+            "**⏭ Skip Week** — sets the tournament to display next week's schedule instead. "
+            "Use this when a tournament cycle is cancelled. "
+            "Requires confirmation. The channel is renamed to `tournament-»-end`.\n\n"
+            "**↩ Restore** — cancels an active skip and returns to the current week's schedule.\n\n"
+            "The tournament channel updates automatically every few minutes to show "
+            "live, upcoming, and ended region status."
+        )),
+        ("🌐  Timezone Converter", (
+            "Converts a local time to UTC so you can enter it accurately in Create or Update.\n\n"
+            "1. Press 🌐 and select your timezone from the dropdown.\n"
+            "2. Enter the local date and time in the modal.\n"
+            "3. The bot responds with the equivalent UTC time and a Discord timestamp.\n\n"
+            "Use the UTC values shown in the response as input for Create Timer or Update Timer.\n\n"
+            "Supported regions include Europe, Africa, Asia, Oceania, and the Americas. "
+            "See the Timezone Converter category for the full list."
+        )),
+        ("🔒  Logout", (
+            "Releases your active session so another administrator can use the panel.\n\n"
+            "The panel reverts to the login screen. "
+            "Your timer selection is cleared.\n\n"
+            "Sessions expire automatically after **15 minutes of inactivity** — "
+            "you do not need to log out manually unless handing control to another admin.\n\n"
+            "If an idle session is blocking access, a new admin can reclaim it by pressing "
+            "Login — the bot will automatically evict the expired session and grant access."
+        )),
+    ],
+
+    "Timer System": [
+        ("Voice Channel Naming", (
+            "Each active timer owns a Discord voice channel. "
+            "The channel name is updated automatically by the background task.\n\n"
+            "Format while running:\n"
+            "`⏲️ Name » Xd Yh`  or  `⏲️ Name » ZM` (under 1 hour)\n\n"
+            "Format when ended (End Mode):\n"
+            "`⏲️ Name » ENDED`\n\n"
+            "**Name length limit** — timer names are capped at 30 characters. "
+            "Discord voice channel names have their own limit; the bot formats the "
+            "full channel name automatically within that limit."
+        )),
+        ("Reminder System", (
+            "Every timer automatically sends two reminder notifications to the log channel.\n\n"
+            "**12-hour reminder** — sent when fewer than 12 hours remain and the "
+            "timer has not already been warned at this checkpoint.\n\n"
+            "**1-hour reminder** — sent when fewer than 1 hour remains.\n\n"
+            "Both reminders are persisted in the database and survive bot restarts. "
+            "Each fires at most once per timer per lifecycle. "
+            "Extending or updating a timer resets both flags, so a fresh set of "
+            "reminders will fire on the new schedule.\n\n"
+            "If a timer is created with less than 12 hours remaining, only the "
+            "applicable reminder(s) fire — the 12-hour check is skipped if the "
+            "window has already passed."
+        )),
+        ("Automatic Deletion vs End Mode", (
+            "**Default** — when a timer expires, the voice channel is deleted "
+            "and the database record is removed.\n\n"
+            "**End Mode** — when enabled via 🏁, the channel is renamed to "
+            "`⏲️ Name » ENDED` instead. The record is preserved with `ended = 1`. "
+            "The channel remains in the server until you delete it manually via 🗑.\n\n"
+            "End Mode is useful for tournaments or events where the channel should "
+            "remain visible as a historical marker after the timer finishes."
+        )),
+        ("Duration Limits", (
+            "**Maximum duration** — 2 years from the current date.\n"
+            "Attempting to create or update a timer beyond this limit shows a "
+            "validation error with the exact cutoff date.\n\n"
+            "This limit applies to:\n"
+            "— Create Timer\n"
+            "— Update Timer\n"
+            "— Extend Timer\n"
+            "— Scheduled creations and updates\n\n"
+            "**Name length** — 30 characters maximum. "
+            "Exceeded names are rejected with a clear error; names are never silently truncated."
+        )),
+    ],
+
+    "Schedule System": [
+        ("How Scheduling Works", (
+            "Scheduling is built into the Create and Update modals — "
+            "there is no separate Schedule button.\n\n"
+            "Both modals have two optional fields at the bottom:\n"
+            "— **Schedule Date** (`YYYY-MM-DD`)\n"
+            "— **Schedule Time** (`HH:MM` UTC)\n\n"
+            "Leave both blank → executes immediately (default behaviour).\n"
+            "Fill both → stores the job and executes at the given time.\n\n"
+            "The scheduled job worker polls every 30 seconds. "
+            "Jobs are persisted in a dedicated database table and survive bot restarts."
+        )),
+        ("Scheduled Timer Creation", (
+            "When Create Timer is used with schedule fields filled:\n\n"
+            "1. No voice channel is created yet.\n"
+            "2. A `create_timer` job is stored with the creation time and end time.\n"
+            "3. When the scheduled time arrives, the bot creates the voice channel, "
+            "registers the timer in the database, and starts the background countdown task.\n"
+            "4. From that point the timer behaves identically to one created manually.\n\n"
+            "Scheduled creations appear in the Overview panel (📊) under **Scheduled Jobs** "
+            "until they execute."
+        )),
+        ("Scheduled Timer Updates", (
+            "When Update Timer is used with schedule fields filled:\n\n"
+            "1. The existing timer continues running unchanged.\n"
+            "2. An `update_timer` job is stored linked to the timer's channel.\n"
+            "3. When the scheduled time arrives, the bot applies the new name and end time, "
+            "resets reminder flags, and restarts the countdown.\n\n"
+            "**Multiple scheduled updates** for the same timer are safe. "
+            "They execute in chronological order.\n\n"
+            "**Automatic cancellation** — if the timer is deleted before the scheduled "
+            "update fires, the pending job is automatically marked as cancelled.\n\n"
+            "Pending updates appear in the Overview panel under **Scheduled Jobs**."
+        )),
+        ("Deferred Extend (Apply When Timer Ends)", (
+            "Extend Timer (⏳) offers a second option: **Apply When Timer Ends**.\n\n"
+            "This is different from scheduling — it does not fire at a fixed clock time. "
+            "Instead, the extension is queued and fires the moment the timer reaches zero.\n\n"
+            "Sequence of events:\n"
+            "1. Timer runs normally.\n"
+            "2. At expiry, the queued extension is applied first.\n"
+            "3. The end time is pushed forward by the chosen duration.\n"
+            "4. The countdown task restarts with the new end time.\n"
+            "5. The channel is not deleted.\n\n"
+            "This is useful for chaining timer cycles without needing to be online at expiry."
+        )),
+    ],
+
+    "Tournament": [
+        ("Tournament Channel Overview", (
+            "The tournament system maintains a single live-updating channel in the server. "
+            "It displays three regional tournament schedules:\n\n"
+            "— 🌏 Asia & Middle East\n"
+            "— 🌍 Africa & Europe\n"
+            "— 🌎 America\n\n"
+            "Each region shows its start and end times and a live/upcoming/ended status. "
+            "The channel name updates automatically to reflect whether a tournament is running."
+        )),
+        ("Create and Delete", (
+            "**Create (➕)** — creates the tournament channel and pins the live schedule. "
+            "Only one channel can exist per server at a time. "
+            "Attempting to create a second one returns the existing channel.\n\n"
+            "**Delete (🗑)** — removes the active channel and its database record. "
+            "A confirmation dialog appears before deletion. "
+            "The background update task is stopped automatically."
+        )),
+        ("Skip Week and Restore", (
+            "**Skip Week (⏭)** — marks the current cycle as cancelled. "
+            "The channel displays next week's schedule instead of the current one. "
+            "The channel is renamed to `tournament-»-end`.\n\n"
+            "Use this when a scheduled tournament round is not happening.\n\n"
+            "**Restore (↩)** — cancels an active skip and returns to the current week. "
+            "The channel reverts to the appropriate name based on live status.\n\n"
+            "The skip state is persisted in the database and survives restarts."
+        )),
+    ],
+
+    "Timezone Converter": [
+        ("Supported Timezones", (
+            "The converter supports 15 preset regions:\n\n"
+            "🇬🇧 London (GMT/BST) · 🇪🇺 Central Europe (CET) · 🇷🇺 Moscow (MSK)\n"
+            "🌍 East Africa (EAT) · 🌍 West Africa (WAT) · 🇸🇦 Gulf/Arabia (AST)\n"
+            "🇮🇳 India (IST) · 🇸🇬 Singapore (SGT) · 🇯🇵 Japan (JST)\n"
+            "🇦🇺 Australia/Sydney (AEST) · 🇧🇷 Brazil (BRT)\n"
+            "🇺🇸 US Eastern (ET) · 🇺🇸 US Central (CT) · "
+            "🇺🇸 US Mountain (MT) · 🇺🇸 US Pacific (PT)\n\n"
+            "All daylight saving transitions are handled automatically."
+        )),
+        ("How to Use", (
+            "1. Press 🌐 from the timer panel.\n"
+            "2. Select your local timezone from the dropdown.\n"
+            "3. Enter the local date (`YYYY-MM-DD`) and time (`HH:MM`, 24h).\n"
+            "4. The bot returns:\n"
+            "   — The equivalent UTC date and time\n"
+            "   — A Discord formatted timestamp\n"
+            "   — The exact values to paste into Create or Update Timer\n\n"
+            "**Example**\n"
+            "Input: `2026-09-01` at `20:00` in US Eastern (ET)\n"
+            "Output: UTC `2026-09-02 00:00` → End Date `2026-09-02`, End Time `00:00`"
+        )),
+    ],
+
+    "Security": [
+        ("Administrator Requirement", (
+            "Every interaction with the timer panel requires Discord **Administrator** permission "
+            "in the server. This is checked on every button press and modal submission — "
+            "not just at login.\n\n"
+            "A small set of override user IDs (`DAX`) can also access the panel "
+            "regardless of server role, for bot developers."
+        )),
+        ("Server Whitelist", (
+            "The bot maintains a hardcoded whitelist of authorized server IDs (`ALLOWED_GUILDS`). "
+            "If the bot is added to any server not on the list:\n\n"
+            "— It immediately leaves the server.\n"
+            "— The event is logged to the audit channel.\n"
+            "— No commands, timers, or database entries are created.\n\n"
+            "Every slash command and background task also validates guild authorization "
+            "before performing any work."
+        )),
+        ("Session Locking", (
+            "Only one administrator can use the panel per server at a time.\n\n"
+            "**Login** — pressing Login acquires an exclusive session. "
+            "Other admins see a 'Panel in use by...' message until the session ends.\n\n"
+            "**Automatic timeout** — sessions expire after 15 minutes of inactivity. "
+            "An idle session can be reclaimed by any other admin pressing Login.\n\n"
+            "**Logout** — releases the session immediately. "
+            "Always log out when handing the panel to another admin."
+        )),
+        ("Duplicate Interaction Prevention", (
+            "Discord can re-deliver the same modal submission under high latency. "
+            "The bot uses two guards to prevent duplicate timer creation:\n\n"
+            "**Idempotency set** — interaction IDs are tracked. "
+            "Any re-delivery of the same interaction ID is rejected before any work is done.\n\n"
+            "**Per-guild creation mutex** — only one Create Timer callback can run at a time "
+            "per server. Concurrent submissions are serialised, not duplicated."
+        )),
+        ("Database Safety", (
+            "**Disk-full protection** — if a write fails because the disk is full, "
+            "the bot attempts an emergency WAL checkpoint to reclaim space, then retries once. "
+            "If the write still fails, the Discord-side action (channel creation, deletion, etc.) "
+            "is aborted entirely so the database and Discord remain in sync.\n\n"
+            "**Deferred ops and cascade cleanup** — when a timer is deleted, "
+            "all pending deferred operations and scheduled updates are automatically cancelled.\n\n"
+            "**Startup recovery** — on restart, the bot reconciles the database against "
+            "Discord's actual channel list. Orphaned records are removed. "
+            "All background tasks resume."
+        )),
+    ],
+
+    "FAQ": [
+        ("Why didn't my timer create?", (
+            "Check the following:\n\n"
+            "1. **Name too long** — timer names must be 30 characters or fewer.\n"
+            "2. **Date in the past** — end time must be in the future.\n"
+            "3. **Beyond 2-year limit** — the end date cannot exceed 2 years from now.\n"
+            "4. **Schedule time in the past** — if using scheduling, the schedule time "
+            "must also be in the future.\n"
+            "5. **Partial schedule fields** — both Schedule Date and Schedule Time must "
+            "be filled or both must be blank. Providing only one is rejected.\n"
+            "6. **Bot missing permissions** — the bot needs Manage Channels permission "
+            "to create voice channels."
+        )),
+        ("Why can't another admin use the panel?", (
+            "The panel is session-locked — only one administrator can be logged in per server. "
+            "The current session holder must log out (🔒) before another admin can log in.\n\n"
+            "If the current session holder is idle, their session expires automatically "
+            "after 15 minutes. After that, any admin pressing Login will reclaim the session "
+            "and gain access immediately."
+        )),
+        ("What is the difference between End Mode and normal deletion?", (
+            "**Normal deletion** — the voice channel is permanently deleted when the timer "
+            "reaches zero. Nothing remains in the server.\n\n"
+            "**End Mode** — the channel is renamed to `⏲️ Name » ENDED` and preserved. "
+            "It stays in the server indefinitely as a visible marker that the timer finished. "
+            "Delete it manually via 🗑 when you no longer need it."
+        )),
+        ("Why is the 2-year limit in place?", (
+            "Creating a timer far in the future would hold a voice channel open indefinitely. "
+            "The 2-year cap prevents accidental or malicious creation of extremely "
+            "long-lived channels while still supporting all realistic tournament and "
+            "event scheduling needs."
+        )),
+        ("Why did my scheduled timer wait instead of creating immediately?", (
+            "If you filled in the Schedule Date and Schedule Time fields, the bot treats "
+            "that as a future creation request. The timer will be created at the exact "
+            "time you specified, not when you submitted the modal.\n\n"
+            "Leave both schedule fields completely blank to create the timer immediately."
+        )),
+        ("Why didn't a deleted timer disappear from the server?", (
+            "If a timer is in **End Mode**, deleting it via 🗑 removes the database record "
+            "and the voice channel. However, if the channel was already renamed to ENDED "
+            "before you pressed delete, Discord may briefly show a cached state.\n\n"
+            "If a channel persists after deletion, it was likely deleted successfully — "
+            "refresh your Discord client. If it genuinely remains, the bot may have lacked "
+            "the Manage Channels permission at the moment of deletion."
+        )),
+        ("Why did my 12-hour reminder not fire?", (
+            "The 12-hour reminder only fires if the timer had more than 1 hour remaining "
+            "when the 12-hour window was crossed. Possible reasons it was skipped:\n\n"
+            "1. The timer was created with less than 12 hours remaining.\n"
+            "2. The bot was offline when the 12-hour mark passed (the reminder is "
+            "suppressed rather than sent late to avoid stale notifications).\n"
+            "3. The timer was extended or updated — this resets reminder flags, "
+            "so the 12h reminder will re-fire at the appropriate time."
+        )),
+    ],
+}
+
+
+def _build_help_category_view(category: str) -> discord.ui.DesignerView:
+    """Build a DesignerView for a given help category key."""
+    view     = discord.ui.DesignerView(timeout=None)
+    sections = _HELP_CONTENT.get(category, [])
+
+    # Category header
+    emoji_map = {label: emoji for label, emoji, _ in _HELP_CATEGORIES}
+    emoji     = emoji_map.get(category, "📖")
+
+    header = discord.ui.Container(color=discord.Color.blurple())
+    header.add_text(f"{emoji} **{category}**")
+    view.add_item(header)
+
+    for title, body in sections:
+        c = discord.ui.Container(color=discord.Color.dark_gray())
+        c.add_text(f"**{title}**")
+        c.add_separator(divider=True)
+        c.add_text(body)
+        view.add_item(c)
+
+    return view
+
+
+class HelpCategorySelect(discord.ui.Select):
+    """Dropdown that rebuilds the help panel when a category is selected."""
+
+    def __init__(self):
+        options = [
+            discord.SelectOption(
+                label=label,
+                emoji=emoji,
+                description=desc[:100],
+                value=label,
+            )
+            for label, emoji, desc in _HELP_CATEGORIES
+        ]
+        super().__init__(
+            placeholder="Select a category…",
+            options=options,
+            custom_id="help_category_select",
+        )
+
+    async def callback(self, itx: discord.Interaction):
+        category = self.values[0]
+        new_view = _build_help_index_view(selected=category)
+        await ix.safe_components_edit(itx, new_view)
+
+
+def _build_help_index_view(selected: str | None = None) -> discord.ui.DesignerView:
+    """
+    Build the full help panel: header + dropdown + (if selected) category content.
+    """
+    view = discord.ui.DesignerView(timeout=None)
+
+    # ── Master header ─────────────────────────────────────────────────
+    header = discord.ui.Container(color=discord.Color.blurple())
+    header.add_text("**Timer Bot — Help**")
+    header.add_separator(divider=True)
+    header.add_text(
+        "Select a category from the dropdown below to read the documentation.\n"
+        "Use `/timerpanel` to open the admin control panel."
+    )
+    view.add_item(header)
+
+    # ── Category dropdown ─────────────────────────────────────────────
+    dropdown_row = discord.ui.ActionRow(HelpCategorySelect())
+    view.add_item(dropdown_row)
+
+    # ── Category content (if selected) ───────────────────────────────
+    if selected and selected in _HELP_CONTENT:
+        emoji_map = {label: emoji for label, emoji, _ in _HELP_CATEGORIES}
+        emoji     = emoji_map.get(selected, "📖")
+
+        cat_header = discord.ui.Container(color=discord.Color.dark_blue())
+        cat_header.add_text(f"{emoji} **{selected}**")
+        view.add_item(cat_header)
+
+        for title, body in _HELP_CONTENT[selected]:
+            c = discord.ui.Container(color=discord.Color.dark_gray())
+            c.add_text(f"**{title}**")
+            c.add_separator(divider=True)
+            c.add_text(body)
+            view.add_item(c)
+
+    return view
+
+
+async def cmd_help_handler(ctx) -> None:
+    """Handler for /help — responds with the interactive documentation panel."""
+    if not is_guild_allowed(ctx.guild.id):
+        return await ctx.respond("This guild is not authorized.", ephemeral=True)
+    await ctx.respond(view=_build_help_index_view(), ephemeral=True)
 
 
 # ════════════════════════════════════════════════════════════════════════
