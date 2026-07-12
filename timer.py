@@ -55,7 +55,7 @@ SESSION_TIMEOUT_SECS  = 15 * 60   # 15 minutes of inactivity
 # Only guilds in this set may use the bot. Any other guild triggers an
 # immediate leave. Add your authorized guild IDs here.
 ALLOWED_GUILDS: set[int] = {
-    1485974710847013014,   # replace with actual guild IDs
+    1452099895564439682,   # replace with actual guild IDs
     1428800178848010331,
 }
 
