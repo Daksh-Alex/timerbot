@@ -55,7 +55,7 @@ SESSION_TIMEOUT_SECS  = 15 * 60   # 15 minutes of inactivity
 # Only guilds in this set may use the bot. Any other guild triggers an
 # immediate leave. Add your authorized guild IDs here.
 ALLOWED_GUILDS: set[int] = {
-    1452099895564439682,   # replace with actual guild IDs
+    1485974710847013014,   # replace with actual guild IDs
     1428800178848010331,
 }
 
@@ -197,6 +197,55 @@ _TIMER_CREATION_LOCKS: dict[int, asyncio.Lock] = {}
 # Prevents duplicate execution if Discord re-delivers the same modal submission.
 # Entries are removed after the callback completes (success or error).
 _CREATE_INTERACTION_IDS: set[int] = set()
+
+# ════════════════════════════════════════════════════════════════════════
+# COMPONENT V2 BUDGET MANAGEMENT
+#
+# Discord rejects any DesignerView whose total component tree exceeds 40.
+# The count includes every item at every nesting level:
+#   Container       = 1  (plus each of its children)
+#   ActionRow       = 1  (plus each of its children)
+#   TextDisplay     = 1  (from container.add_text())
+#   Separator       = 1  (from container.add_separator())
+#   Button          = 1
+#   Select          = 1
+#
+# Root cause of the 50035 error:
+#   - btn_view (Overview): each timer added 1 TextDisplay inside containers.
+#     With enough timers + archived + scheduled, the total exceeded 40.
+#   - Help panel (Timer Panel category): 9 sections × 4 components = 36
+#     plus 8 fixed components = 44. Always crashed.
+#
+# Fix: never add one component per item. Pack all items of the same
+# category into one text block inside one Container. Use pagination when
+# the packed list would still exceed the per-category character limit,
+# not when the component count grows.
+# ════════════════════════════════════════════════════════════════════════
+
+DISCORD_COMPONENT_LIMIT = 40
+
+
+def _count_components(view: discord.ui.DesignerView) -> int:
+    """
+    Recursively count every Component V2 object in a DesignerView.
+    Uses duck-typing so it works without importing private Discord internals.
+    """
+    def _count(item) -> int:
+        n = 1  # the item itself
+        children = getattr(item, "children", None) or getattr(item, "_children", None) or []
+        # Containers store children in ._children; ActionRows in .children
+        # Try both attribute names defensively
+        if not children:
+            children = getattr(item, "_components", [])
+        for child in children:
+            n += _count(child)
+        return n
+
+    total = 0
+    items = getattr(view, "children", []) or getattr(view, "_children", [])
+    for item in items:
+        total += _count(item)
+    return total
 
 # ════════════════════════════════════════════════════════════════════════
 # DATABASE LAYER
@@ -2765,6 +2814,239 @@ class TournamentPanelView(discord.ui.View):
 # ADMIN PANEL BUTTONS
 # ════════════════════════════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════════════════════════════
+# OVERVIEW BUILDER
+#
+# Component budget analysis (worst case):
+#   1 header container  = 1 + 3 text/sep children = 4
+#   1 active  container = 1 + 1 header + 1 sep + 1 packed-text = 4
+#   1 endmode container = 4
+#   1 archived container= 4
+#   1 scheduled container=4
+#   1 tournament container=4
+#   1 db container      = 4
+#   1 pagination ActionRow = 1 + 2 buttons = 3
+#   ─────────────────────────────────────────
+#   TOTAL MAX            = 31   (well within 40)
+#
+# Timers are packed into a single multi-line text block per category.
+# No matter how many timers exist, each category consumes exactly 4
+# components. Pagination only affects which page of text is shown,
+# never the component count.
+# ════════════════════════════════════════════════════════════════════════
+
+# Items per page for the active-timers text list inside the overview
+_OVERVIEW_PAGE_SIZE = 10
+
+
+class OverviewPageView(discord.ui.View):
+    """
+    Pagination controls for the Overview panel.
+    Renders Prev / Next buttons only when there are multiple pages.
+    The view itself only carries the buttons; the DesignerView that
+    wraps it is built by _build_overview_view().
+    """
+    def __init__(self, guild, page: int, total_pages: int, session_id: str | None = None):
+        super().__init__(timeout=300)
+        self.guild       = guild
+        self.page        = page
+        self.total_pages = total_pages
+        self.session_id  = session_id
+
+        if page > 0:
+            self.add_item(self._prev_button())
+        if page < total_pages - 1:
+            self.add_item(self._next_button())
+
+    def _prev_button(self):
+        btn = discord.ui.Button(
+            label=f"◀  Page {self.page}",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"overview_prev_{self.page}",
+        )
+        btn.callback = self._go_prev
+        return btn
+
+    def _next_button(self):
+        btn = discord.ui.Button(
+            label=f"Page {self.page + 2}  ▶",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"overview_next_{self.page}",
+        )
+        btn.callback = self._go_next
+        return btn
+
+    async def _go_prev(self, itx: discord.Interaction):
+        new_view = await _build_overview_view(self.guild, page=self.page - 1)
+        await ix.safe_components_edit(itx, new_view)
+
+    async def _go_next(self, itx: discord.Interaction):
+        new_view = await _build_overview_view(self.guild, page=self.page + 1)
+        await ix.safe_components_edit(itx, new_view)
+
+
+async def _build_overview_view(guild, page: int = 0) -> discord.ui.DesignerView:
+    """
+    Build the Overview DesignerView.
+
+    Component budget: always ≤ 31 components regardless of data volume.
+    Each timer category is packed into ONE text block inside ONE container.
+    Pagination changes which slice of the active-timer list is shown,
+    not the number of components.
+    """
+    timer_rows  = await db_all_timers()
+    tour_rows   = await db_all_tournament_channels()
+    skip_active = await db_get_skip_next()
+    scheduled   = await db_all_scheduled_timers()
+    sizes       = _db_file_sizes()
+    free_mb     = _free_disk_mb()
+
+    active  = [r for r in timer_rows if not r["ended"] and not r["no_delete"]]
+    endmode = [r for r in timer_rows if not r["ended"] and r["no_delete"]]
+    ended   = [r for r in timer_rows if r["ended"]]
+
+    # ── Pagination on active timers only ─────────────────────────────
+    total_active   = len(active)
+    total_pages    = max(1, -(-total_active // _OVERVIEW_PAGE_SIZE))  # ceil div
+    page           = max(0, min(page, total_pages - 1))
+    active_page    = active[page * _OVERVIEW_PAGE_SIZE:(page + 1) * _OVERVIEW_PAGE_SIZE]
+
+    view = discord.ui.DesignerView(timeout=300)
+
+    # ── Header ────────────────────────────────────────────────────────
+    # Component cost: 1 container + 1 text + 1 sep + 1 text = 4
+    h = discord.ui.Container(color=discord.Color.blurple())
+    h.add_text("**Overview**")
+    h.add_separator(divider=True)
+    summary_parts = []
+    if active:
+        summary_parts.append(f"{len(active)} active")
+    if endmode:
+        summary_parts.append(f"{len(endmode)} end-mode")
+    if ended:
+        summary_parts.append(f"{len(ended)} archived")
+    if scheduled:
+        summary_parts.append(f"{len(scheduled)} scheduled")
+    h.add_text("  ·  ".join(summary_parts) if summary_parts else "No timers")
+    view.add_item(h)
+
+    # ── Active timers ─────────────────────────────────────────────────
+    # Component cost: 1 container + 1 text + 1 sep + 1 text = 4 ALWAYS
+    c_active = discord.ui.Container(color=discord.Color.blurple())
+    page_label = f"  (page {page + 1}/{total_pages})" if total_pages > 1 else ""
+    c_active.add_text(f"**Active Timers{page_label}**")
+    c_active.add_separator(divider=True)
+    if active_page:
+        lines = []
+        for row in active_page:
+            try:
+                end    = datetime.fromisoformat(row["end_time"])
+                ts     = int(end.timestamp())
+                ops    = await db_get_deferred_ops(row["channel_id"])
+                badge  = " ⏳" if ops else ""
+                lines.append(f"**{row['name']}**{badge}  —  <t:{ts}:R>")
+            except Exception:
+                lines.append(f"**{row['name']}**  —  (error reading time)")
+        c_active.add_text("\n".join(lines))
+    else:
+        c_active.add_text("No active timers.")
+    view.add_item(c_active)
+
+    # ── End Mode timers ───────────────────────────────────────────────
+    # Component cost: 4 ALWAYS (only added when non-empty)
+    if endmode:
+        c_em = discord.ui.Container(color=discord.Color.orange())
+        c_em.add_text("**End Mode**")
+        c_em.add_separator(divider=True)
+        lines = []
+        for row in endmode:
+            try:
+                end = datetime.fromisoformat(row["end_time"])
+                ts  = int(end.timestamp())
+                lines.append(f"🏁 **{row['name']}**  —  <t:{ts}:R>")
+            except Exception:
+                lines.append(f"🏁 **{row['name']}**")
+        c_em.add_text("\n".join(lines))
+        view.add_item(c_em)
+
+    # ── Archived timers ───────────────────────────────────────────────
+    # Component cost: 4 ALWAYS (only added when non-empty)
+    if ended:
+        c_ar = discord.ui.Container(color=discord.Color.dark_gray())
+        c_ar.add_text("**Archived**")
+        c_ar.add_separator(divider=True)
+        c_ar.add_text("\n".join(f"● {r['name']}" for r in ended))
+        view.add_item(c_ar)
+
+    # ── Scheduled jobs ────────────────────────────────────────────────
+    # Component cost: 4 ALWAYS (only added when non-empty)
+    if scheduled:
+        c_sc = discord.ui.Container(color=discord.Color.teal())
+        c_sc.add_text("**Scheduled Jobs**")
+        c_sc.add_separator(divider=True)
+        lines = []
+        for job in scheduled:
+            try:
+                op   = job["op_type"] if "op_type" in job.keys() else "create_timer"
+                cts  = int(datetime.fromisoformat(job["create_at"]).timestamp())
+                icon = "✏" if op == "update_timer" else "📅"
+                lines.append(f"{icon} **{job['name']}**  —  <t:{cts}:R>")
+            except Exception:
+                lines.append(f"📅 **{job['name']}**")
+        c_sc.add_text("\n".join(lines))
+        view.add_item(c_sc)
+
+    # ── Tournament ────────────────────────────────────────────────────
+    # Component cost: 4 ALWAYS
+    c_t = discord.ui.Container(color=discord.Color.gold())
+    c_t.add_text("**Tournament**")
+    c_t.add_separator(divider=True)
+    tour_lines = []
+    for trow in tour_rows:
+        ch = guild.get_channel(int(trow["channel_id"]))
+        if ch:
+            tour_lines.append(f"Channel: {ch.mention}")
+    if not tour_lines:
+        tour_lines.append("No active channel.")
+    if skip_active:
+        tour_lines.append("Skip: active — next week shown")
+    c_t.add_text("\n".join(tour_lines))
+    view.add_item(c_t)
+
+    # ── Database ──────────────────────────────────────────────────────
+    # Component cost: 4 ALWAYS
+    db_mb  = sizes["db"]  / (1024 * 1024)
+    wal_mb = sizes["wal"] / (1024 * 1024)
+    c_db   = discord.ui.Container(
+        color=discord.Color.yellow() if (0 <= free_mb < 200) else discord.Color.dark_gray()
+    )
+    c_db.add_text("**Database**")
+    c_db.add_separator(divider=True)
+    disk_line = (f"⚠️ Low disk: {free_mb:.0f} MB free"
+                 if 0 <= free_mb < 200 else f"Free: {free_mb:.0f} MB")
+    c_db.add_text(f"DB: {db_mb:.2f} MB  ·  WAL: {wal_mb:.2f} MB\n{disk_line}")
+    view.add_item(c_db)
+
+    # ── Pagination buttons ────────────────────────────────────────────
+    # Component cost: 0 (no pages) or 3 (1 ActionRow + 1-2 buttons)
+    if total_pages > 1:
+        page_view = OverviewPageView(guild, page, total_pages)
+        if page_view.children:
+            view.add_item(discord.ui.ActionRow(*page_view.children))
+
+    # ── Final safety assertion ────────────────────────────────────────
+    # This should never fire in production; it's a development safeguard.
+    count = _count_components(view)
+    if count > DISCORD_COMPONENT_LIMIT:
+        print(
+            f"[OVERVIEW] BUG: component count {count} exceeds {DISCORD_COMPONENT_LIMIT}. "
+            f"page={page} active={len(active)} endmode={len(endmode)} "
+            f"archived={len(ended)} scheduled={len(scheduled)}"
+        )
+
+    return view
+
+
 class AdminPanelView(discord.ui.View):
     def __init__(self, guild, session_id: str):
         super().__init__(timeout=86400)
@@ -2933,120 +3215,10 @@ class AdminPanelView(discord.ui.View):
     async def btn_view(self, btn, itx: discord.Interaction):
         if not self._auth(itx):
             return await ix.reply_session_expired(itx)
-
-        timer_rows    = await db_all_timers()
-        tour_rows     = await db_all_tournament_channels()
-        skip_active   = await db_get_skip_next()
-        scheduled     = await db_all_scheduled_timers()
-        sizes         = _db_file_sizes()
-        free_mb       = _free_disk_mb()
-
-        v = discord.ui.DesignerView()
-
-        # ── Active timers ───────────────────────────────────────────
-        active  = [r for r in timer_rows if not r["ended"]]
-        endmode = [r for r in active if r["no_delete"]]
-        normal  = [r for r in active if not r["no_delete"]]
-        ended   = [r for r in timer_rows if r["ended"]]
-
-        if normal:
-            c = discord.ui.Container(color=discord.Color.blurple())
-            c.add_text("**Active Timers**")
-            c.add_separator(divider=True)
-            for row in normal:
-                try:
-                    end    = datetime.fromisoformat(row["end_time"])
-                    ts     = int(end.timestamp())
-                    ops    = await db_get_deferred_ops(row["channel_id"])
-                    badges = " ⏳" if ops else ""
-                    c.add_text(f"**{row['name']}**{badges}  —  <t:{ts}:R>  (<t:{ts}:F>)")
-                except Exception:
-                    pass
-            v.add_item(c)
-
-        if endmode:
-            c2 = discord.ui.Container(color=discord.Color.orange())
-            c2.add_text("**End Mode Timers**")
-            c2.add_separator(divider=True)
-            for row in endmode:
-                try:
-                    end = datetime.fromisoformat(row["end_time"])
-                    ts  = int(end.timestamp())
-                    c2.add_text(f"🏁 **{row['name']}**  —  <t:{ts}:R>  (<t:{ts}:F>)")
-                except Exception:
-                    pass
-            v.add_item(c2)
-
-        if ended:
-            c3 = discord.ui.Container(color=discord.Color.dark_gray())
-            c3.add_text("**Archived / Ended Timers**")
-            c3.add_separator(divider=True)
-            for row in ended:
-                c3.add_text(f"● {row['name']}  —  ENDED  (delete via 🗑)")
-            v.add_item(c3)
-
-        if not timer_rows:
-            c_empty = discord.ui.Container(color=discord.Color.dark_gray())
-            c_empty.add_text("No timers.")
-            v.add_item(c_empty)
-
-        # ── Scheduled jobs ────────────────────────────────────────────
-        if scheduled:
-            cs = discord.ui.Container(color=discord.Color.teal())
-            cs.add_text("**Scheduled Jobs**")
-            cs.add_separator(divider=True)
-            for job in scheduled:
-                try:
-                    op_type = job["op_type"] if "op_type" in job.keys() else "create_timer"
-                    cts = int(datetime.fromisoformat(job["create_at"]).timestamp())
-                    ets = int(datetime.fromisoformat(job["end_time"]).timestamp())
-                    if op_type == "update_timer":
-                        cs.add_text(
-                            f"✏ **{job['name']}** (update)\n"
-                            f"Applies: <t:{cts}:F> (<t:{cts}:R>)\n"
-                            f"New end: <t:{ets}:F>"
-                        )
-                    else:
-                        cs.add_text(
-                            f"📅 **{job['name']}** (create)\n"
-                            f"Creates: <t:{cts}:F> (<t:{cts}:R>)\n"
-                            f"Expires: <t:{ets}:F>"
-                        )
-                except Exception:
-                    pass
-            v.add_item(cs)
-
-        # ── Tournament ────────────────────────────────────────────────
-        ct = discord.ui.Container(color=discord.Color.gold())
-        ct.add_text("**Tournament**")
-        ct.add_separator(divider=True)
-        tour_active = False
-        for trow in tour_rows:
-            ch = itx.guild.get_channel(int(trow["channel_id"]))
-            if ch:
-                tour_active = True
-                ct.add_text(f"Channel: {ch.mention}")
-        if not tour_active:
-            ct.add_text("No active channel.")
-        ct.add_text("Skip: **active** — showing next week" if skip_active else "Skip: none")
-        v.add_item(ct)
-
-        # ── DB stats ──────────────────────────────────────────────────
-        db_mb  = sizes["db"]  / (1024 * 1024)
-        wal_mb = sizes["wal"] / (1024 * 1024)
-        cd = discord.ui.Container(
-            color=discord.Color.yellow() if (0 <= free_mb < 200) else discord.Color.dark_gray()
+        await ix.safe_send_response(
+            itx,
+            view=await _build_overview_view(itx.guild, page=0),
         )
-        cd.add_text("**Database**")
-        cd.add_separator(divider=True)
-        cd.add_text(
-            f"DB: {db_mb:.2f} MB  ·  WAL: {wal_mb:.2f} MB"
-            + (f"\n⚠️ Low disk: {free_mb:.0f} MB free" if 0 <= free_mb < 200 else
-               f"\nFree: {free_mb:.0f} MB")
-        )
-        v.add_item(cd)
-
-        await ix.safe_send_response(itx, view=v)
 
     # ── 🏆 Tournament ────────────────────────────────────────────────
     @discord.ui.button(emoji="🏆", style=discord.ButtonStyle.secondary, custom_id="panel_tournament")
@@ -3642,26 +3814,8 @@ _HELP_CONTENT: dict[str, list[tuple[str, str]]] = {
 
 
 def _build_help_category_view(category: str) -> discord.ui.DesignerView:
-    """Build a DesignerView for a given help category key."""
-    view     = discord.ui.DesignerView(timeout=None)
-    sections = _HELP_CONTENT.get(category, [])
-
-    # Category header
-    emoji_map = {label: emoji for label, emoji, _ in _HELP_CATEGORIES}
-    emoji     = emoji_map.get(category, "📖")
-
-    header = discord.ui.Container(color=discord.Color.blurple())
-    header.add_text(f"{emoji} **{category}**")
-    view.add_item(header)
-
-    for title, body in sections:
-        c = discord.ui.Container(color=discord.Color.dark_gray())
-        c.add_text(f"**{title}**")
-        c.add_separator(divider=True)
-        c.add_text(body)
-        view.add_item(c)
-
-    return view
+    """Build a DesignerView for a given help category key — page 0."""
+    return _build_help_index_view(selected=category, page=0)
 
 
 class HelpCategorySelect(discord.ui.Select):
@@ -3685,17 +3839,41 @@ class HelpCategorySelect(discord.ui.Select):
 
     async def callback(self, itx: discord.Interaction):
         category = self.values[0]
-        new_view = _build_help_index_view(selected=category)
+        new_view = _build_help_index_view(selected=category, page=0)
         await ix.safe_components_edit(itx, new_view)
 
 
-def _build_help_index_view(selected: str | None = None) -> discord.ui.DesignerView:
+# ── Help panel component budget ───────────────────────────────────────
+# Fixed structure per page:
+#   master header container  = 1 + 1 text + 1 sep + 1 text   = 4
+#   dropdown ActionRow       = 1 + 1 select                   = 2
+#   category header container= 1 + 1 text                     = 2
+#   N section containers     = N × (1 + 1 text + 1 sep + 1 text) = N × 4
+#   pagination ActionRow     = 1 + 1-2 buttons                = 2-3
+#   ─────────────────────────────────────────────────────────────────
+#   Total = 8 + N×4 + 3(max pagination) = 11 + N×4
+#
+# Solving for N: 11 + N×4 ≤ 40  →  N ≤ 7.25  →  N_max = 7
+#
+# Timer Panel has 9 sections: split into page 1 (5 sections, cost = 31)
+# and page 2 (4 sections, cost = 27). All other categories fit in 1 page.
+_HELP_MAX_SECTIONS_PER_PAGE = 7
+
+
+def _build_help_index_view(
+    selected: str | None = None,
+    page: int = 0,
+) -> discord.ui.DesignerView:
     """
-    Build the full help panel: header + dropdown + (if selected) category content.
+    Build the full help panel: master header + dropdown + (if selected)
+    paginated category content.
+
+    Component budget: never exceeds 40 regardless of category size.
+    Max components: 4 + 2 + 2 + 7×4 + 3 = 39 (at max 7 sections + pagination).
     """
     view = discord.ui.DesignerView(timeout=None)
 
-    # ── Master header ─────────────────────────────────────────────────
+    # ── Master header (cost: 4) ───────────────────────────────────────
     header = discord.ui.Container(color=discord.Color.blurple())
     header.add_text("**Timer Bot — Help**")
     header.add_separator(divider=True)
@@ -3705,25 +3883,74 @@ def _build_help_index_view(selected: str | None = None) -> discord.ui.DesignerVi
     )
     view.add_item(header)
 
-    # ── Category dropdown ─────────────────────────────────────────────
-    dropdown_row = discord.ui.ActionRow(HelpCategorySelect())
-    view.add_item(dropdown_row)
+    # ── Category dropdown (cost: 2) ───────────────────────────────────
+    view.add_item(discord.ui.ActionRow(HelpCategorySelect()))
 
     # ── Category content (if selected) ───────────────────────────────
-    if selected and selected in _HELP_CONTENT:
-        emoji_map = {label: emoji for label, emoji, _ in _HELP_CATEGORIES}
-        emoji     = emoji_map.get(selected, "📖")
+    if not (selected and selected in _HELP_CONTENT):
+        return view
 
-        cat_header = discord.ui.Container(color=discord.Color.dark_blue())
-        cat_header.add_text(f"{emoji} **{selected}**")
-        view.add_item(cat_header)
+    sections     = _HELP_CONTENT[selected]
+    total_pages  = max(1, -(-len(sections) // _HELP_MAX_SECTIONS_PER_PAGE))
+    page         = max(0, min(page, total_pages - 1))
+    page_sections = sections[
+        page * _HELP_MAX_SECTIONS_PER_PAGE :
+        (page + 1) * _HELP_MAX_SECTIONS_PER_PAGE
+    ]
 
-        for title, body in _HELP_CONTENT[selected]:
-            c = discord.ui.Container(color=discord.Color.dark_gray())
-            c.add_text(f"**{title}**")
-            c.add_separator(divider=True)
-            c.add_text(body)
-            view.add_item(c)
+    emoji_map = {label: emoji for label, emoji, _ in _HELP_CATEGORIES}
+    emoji     = emoji_map.get(selected, "📖")
+
+    # Category header (cost: 2)
+    cat_header = discord.ui.Container(color=discord.Color.dark_blue())
+    page_label = f"  (page {page + 1}/{total_pages})" if total_pages > 1 else ""
+    cat_header.add_text(f"{emoji} **{selected}**{page_label}")
+    view.add_item(cat_header)
+
+    # Section containers (cost: 4 each, max 7 = 28)
+    for title, body in page_sections:
+        c = discord.ui.Container(color=discord.Color.dark_gray())
+        c.add_text(f"**{title}**")
+        c.add_separator(divider=True)
+        c.add_text(body)
+        view.add_item(c)
+
+    # Pagination buttons (cost: 3 max)
+    if total_pages > 1:
+        btns = []
+        if page > 0:
+            prev_btn = discord.ui.Button(
+                label=f"◀  Page {page}",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"help_prev_{selected}_{page}",
+            )
+            # Closure trick: capture current values
+            def _make_prev(cat, pg):
+                async def _cb(itx: discord.Interaction):
+                    await ix.safe_components_edit(
+                        itx, _build_help_index_view(selected=cat, page=pg - 1)
+                    )
+                return _cb
+            prev_btn.callback = _make_prev(selected, page)
+            btns.append(prev_btn)
+
+        if page < total_pages - 1:
+            next_btn = discord.ui.Button(
+                label=f"Page {page + 2}  ▶",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"help_next_{selected}_{page}",
+            )
+            def _make_next(cat, pg):
+                async def _cb(itx: discord.Interaction):
+                    await ix.safe_components_edit(
+                        itx, _build_help_index_view(selected=cat, page=pg + 1)
+                    )
+                return _cb
+            next_btn.callback = _make_next(selected, page)
+            btns.append(next_btn)
+
+        if btns:
+            view.add_item(discord.ui.ActionRow(*btns))
 
     return view
 
