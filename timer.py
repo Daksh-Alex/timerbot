@@ -55,7 +55,7 @@ SESSION_TIMEOUT_SECS  = 15 * 60   # 15 minutes of inactivity
 # Only guilds in this set may use the bot. Any other guild triggers an
 # immediate leave. Add your authorized guild IDs here.
 ALLOWED_GUILDS: set[int] = {
-    1452099895564439682,   # replace with actual guild IDs
+    1485974710847013014,   # replace with actual guild IDs
     1428800178848010331,
 }
 
@@ -223,6 +223,7 @@ _CREATE_INTERACTION_IDS: set[int] = set()
 # ════════════════════════════════════════════════════════════════════════
 
 DISCORD_COMPONENT_LIMIT = 40
+DISCORD_TEXT_LIMIT      = 4000   # total displayable characters across all TextDisplays
 
 
 def _count_components(view: discord.ui.DesignerView) -> int:
@@ -233,8 +234,6 @@ def _count_components(view: discord.ui.DesignerView) -> int:
     def _count(item) -> int:
         n = 1  # the item itself
         children = getattr(item, "children", None) or getattr(item, "_children", None) or []
-        # Containers store children in ._children; ActionRows in .children
-        # Try both attribute names defensively
         if not children:
             children = getattr(item, "_components", [])
         for child in children:
@@ -245,6 +244,41 @@ def _count_components(view: discord.ui.DesignerView) -> int:
     items = getattr(view, "children", []) or getattr(view, "_children", [])
     for item in items:
         total += _count(item)
+    return total
+
+
+def _collect_text(item) -> str:
+    """
+    Recursively collect all displayable text from a component tree node.
+    TextDisplay nodes expose their content via .content or ._content.
+    """
+    # TextDisplay stores text as .content (Pycord) or ._content
+    content = getattr(item, "content", None) or getattr(item, "_content", None)
+    parts   = [content] if isinstance(content, str) else []
+    children = (
+        getattr(item, "children", None)
+        or getattr(item, "_children", None)
+        or getattr(item, "_components", [])
+        or []
+    )
+    for child in children:
+        parts.append(_collect_text(child))
+    return "".join(parts)
+
+
+def validate_component_text(view: discord.ui.DesignerView) -> int:
+    """
+    Return the total displayable character count for a DesignerView.
+    Discord enforces a 4000-character limit across all TextDisplay components.
+    Call this before every send/edit. If it returns > DISCORD_TEXT_LIMIT,
+    the view must be rebuilt with less text before sending.
+
+    Usage pattern:
+        view = _build_something()
+        assert validate_component_text(view) <= DISCORD_TEXT_LIMIT
+    """
+    items = getattr(view, "children", []) or getattr(view, "_children", [])
+    total = sum(len(_collect_text(item)) for item in items)
     return total
 
 # ════════════════════════════════════════════════════════════════════════
@@ -3034,12 +3068,13 @@ async def _build_overview_view(guild, page: int = 0) -> discord.ui.DesignerView:
         if page_view.children:
             view.add_item(discord.ui.ActionRow(*page_view.children))
 
-    # ── Final safety assertion ────────────────────────────────────────
-    # This should never fire in production; it's a development safeguard.
-    count = _count_components(view)
-    if count > DISCORD_COMPONENT_LIMIT:
+    # ── Final safety assertions ───────────────────────────────────────
+    comp_count = _count_components(view)
+    text_count = validate_component_text(view)
+    if comp_count > DISCORD_COMPONENT_LIMIT or text_count > DISCORD_TEXT_LIMIT:
         print(
-            f"[OVERVIEW] BUG: component count {count} exceeds {DISCORD_COMPONENT_LIMIT}. "
+            f"[OVERVIEW] BUG: components={comp_count}/{DISCORD_COMPONENT_LIMIT} "
+            f"text={text_count}/{DISCORD_TEXT_LIMIT}  "
             f"page={page} active={len(active)} endmode={len(endmode)} "
             f"archived={len(ended)} scheduled={len(scheduled)}"
         )
@@ -3364,53 +3399,58 @@ class PanelLoginView(discord.ui.View):
 # ════════════════════════════════════════════════════════════════════════
 
 async def _build_panel_view(guild, session_id: str) -> discord.ui.DesignerView:
+    """
+    Main admin panel.
+
+    Text budget:
+      "**Timer Control Panel**"                          = 25
+      "Session: Name  ·  N timers  ·  /help for guide"  ≤ 80
+      ─────────────────────────────────────────────────────
+      TOTAL                                              ≤ 105 chars  (limit: 4000)
+
+    Component budget: 1 container(6) + 1 ActionRow+Select(2) + 3 ActionRows+9 buttons(12)
+      = 20 components  (limit: 40)
+    """
     view = discord.ui.DesignerView(timeout=86400)
 
-    # ── Header only (no live data containers) ────────────────────────
     s            = get_session(guild.id)
     session_user = s["user_name"] if s else "—"
+    timer_rows   = await db_all_timers()
+    active_count = sum(1 for r in timer_rows if not r["ended"])
+    sched_count  = len(await db_all_scheduled_timers())
 
+    # ── Header (compact — no button listing, that lives in /help) ────
     header = discord.ui.Container(color=discord.Color.blurple())
     header.add_text("**Timer Control Panel**")
     header.add_separator(divider=True)
-    header.add_text(f"Session: **{session_user}**")
-    header.add_separator(divider=True)
-
-    # Controls reference — one line per button
-    header.add_text(
-        "➕  Create timer (or schedule)\n"
-        "✏  Update selected (or schedule)\n"
-        "🗑  Delete selected\n"
-        "⏳  Extend selected\n"
-        "🏁  End Mode selected\n"
-        "📊  Overview\n"
-        "🏆  Tournament\n"
-        "🌐  Timezone\n"
-        "🔒  Logout"
-    )
+    stats_parts = [f"Session: **{session_user}**"]
+    if active_count:
+        stats_parts.append(f"{active_count} timer{'s' if active_count != 1 else ''}")
+    if sched_count:
+        stats_parts.append(f"{sched_count} scheduled")
+    stats_parts.append("📊 for details  ·  /help for guide")
+    header.add_text("  ·  ".join(stats_parts))
     view.add_item(header)
 
     # ── Timer dropdown ────────────────────────────────────────────────
-    timer_rows   = await db_all_timers()
-    dropdown_row = discord.ui.ActionRow(
-        TimerSelect(guild, timer_rows, session_id)
-    )
-    view.add_item(dropdown_row)
+    view.add_item(discord.ui.ActionRow(TimerSelect(guild, timer_rows, session_id)))
 
-    # ── Action buttons (emoji-only)
-    # Row layout: ➕ ✏ 🗑  |  ⏳ 🏁 📊  |  🏆 🌐 🔒
+    # ── Action buttons (emoji-only, 3 per row) ────────────────────────
     apv     = AdminPanelView(guild, session_id)
     buttons = apv.children
-    # buttons order defined by @discord.ui.button declarations:
-    # 0=➕  1=✏  2=🗑  3=⏳  4=🏁  5=📊  6=🏆  7=🌐  8=🔒
+    # Declaration order: 0=➕  1=✏  2=🗑  3=⏳  4=🏁  5=📊  6=🏆  7=🌐  8=🔒
+    view.add_item(discord.ui.ActionRow(buttons[0], buttons[1], buttons[2]))
+    view.add_item(discord.ui.ActionRow(buttons[3], buttons[4], buttons[5]))
+    view.add_item(discord.ui.ActionRow(buttons[6], buttons[7], buttons[8]))
 
-    row1 = discord.ui.ActionRow(buttons[0], buttons[1], buttons[2])   # ➕ ✏ 🗑
-    row2 = discord.ui.ActionRow(buttons[3], buttons[4], buttons[5])   # ⏳ 🏁 📊
-    row3 = discord.ui.ActionRow(buttons[6], buttons[7], buttons[8])   # 🏆 🌐 🔒
-
-    view.add_item(row1)
-    view.add_item(row2)
-    view.add_item(row3)
+    # ── Validation guards (development safeguards — should never fire) ─
+    comp_count = _count_components(view)
+    text_count = validate_component_text(view)
+    if comp_count > DISCORD_COMPONENT_LIMIT or text_count > DISCORD_TEXT_LIMIT:
+        print(
+            f"[PANEL] BUG: components={comp_count}/{DISCORD_COMPONENT_LIMIT} "
+            f"text={text_count}/{DISCORD_TEXT_LIMIT}"
+        )
 
     return view
 
@@ -3843,21 +3883,20 @@ class HelpCategorySelect(discord.ui.Select):
         await ix.safe_components_edit(itx, new_view)
 
 
-# ── Help panel component budget ───────────────────────────────────────
-# Fixed structure per page:
-#   master header container  = 1 + 1 text + 1 sep + 1 text   = 4
-#   dropdown ActionRow       = 1 + 1 select                   = 2
-#   category header container= 1 + 1 text                     = 2
-#   N section containers     = N × (1 + 1 text + 1 sep + 1 text) = N × 4
-#   pagination ActionRow     = 1 + 1-2 buttons                = 2-3
-#   ─────────────────────────────────────────────────────────────────
-#   Total = 8 + N×4 + 3(max pagination) = 11 + N×4
+# ── Help panel budget ─────────────────────────────────────────────────
+# COMPONENT budget: 4 + 2 + 2 + N×4 + 3(pagination) = 11 + N×4
+#   Max N=7 → 39 components ✓
 #
-# Solving for N: 11 + N×4 ≤ 40  →  N ≤ 7.25  →  N_max = 7
+# TEXT budget (4000 char limit):
+#   Fixed header text ≈ 139 chars
+#   Category header   ≈ 25 chars
+#   Each section      ≤ 875 chars (Create Timer, the largest)
+#   3 sections max    = 3 × 875 = 2625 + 164 fixed = 2789 ✓
+#   7 sections would  = 7 × 875 = 6125 + 164 fixed = 6289 ❌
 #
-# Timer Panel has 9 sections: split into page 1 (5 sections, cost = 31)
-# and page 2 (4 sections, cost = 27). All other categories fit in 1 page.
-_HELP_MAX_SECTIONS_PER_PAGE = 7
+# The TEXT limit (4000) is more restrictive than the COMPONENT limit (40)
+# for help content. 3 sections/page satisfies both constraints with margin.
+_HELP_MAX_SECTIONS_PER_PAGE = 3
 
 
 def _build_help_index_view(
@@ -3951,6 +3990,16 @@ def _build_help_index_view(
 
         if btns:
             view.add_item(discord.ui.ActionRow(*btns))
+
+    # ── Validation guards ─────────────────────────────────────────────
+    comp_count = _count_components(view)
+    text_count = validate_component_text(view)
+    if comp_count > DISCORD_COMPONENT_LIMIT or text_count > DISCORD_TEXT_LIMIT:
+        print(
+            f"[HELP] BUG: components={comp_count}/{DISCORD_COMPONENT_LIMIT} "
+            f"text={text_count}/{DISCORD_TEXT_LIMIT} "
+            f"category={selected!r} page={page}"
+        )
 
     return view
 
