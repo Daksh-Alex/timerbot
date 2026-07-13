@@ -170,6 +170,73 @@ async def _backoff(exc: discord.HTTPException) -> None:
     await asyncio.sleep(float(getattr(exc, "retry_after", 1.0)) + 0.25)
 
 
+# ── Components V2 pre-send limits ────────────────────────────────────────
+# These mirror the values in timer.py. i.py intentionally declares them
+# independently so this module has no circular import from timer.py.
+_COMP_LIMIT = 40
+_TEXT_LIMIT = 4000
+
+
+def _count_view_components(view) -> int:
+    """Recursive component count (same algorithm as timer._count_components)."""
+    def _count(item) -> int:
+        n = 1
+        children = (
+            getattr(item, "children", None)
+            or getattr(item, "_children", None)
+            or getattr(item, "_components", [])
+            or []
+        )
+        for child in children:
+            n += _count(child)
+        return n
+    items = getattr(view, "children", []) or getattr(view, "_children", [])
+    return sum(_count(i) for i in items)
+
+
+def _count_view_text(view) -> int:
+    """Total displayable text characters in a DesignerView."""
+    def _text(item) -> str:
+        content  = getattr(item, "content", None) or getattr(item, "_content", None)
+        parts    = [content] if isinstance(content, str) else []
+        children = (
+            getattr(item, "children", None)
+            or getattr(item, "_children", None)
+            or getattr(item, "_components", [])
+            or []
+        )
+        for child in children:
+            parts.append(_text(child))
+        return "".join(parts)
+    items = getattr(view, "children", []) or getattr(view, "_children", [])
+    return sum(len(_text(i)) for i in items)
+
+
+def _check_view_limits(view, location: str) -> str | None:
+    """
+    Validate component count and text size before sending a DesignerView.
+    Returns an error string if either limit is exceeded, else None.
+    Logs the violation to stdout for diagnostics.
+    """
+    comps = _count_view_components(view)
+    text  = _count_view_text(view)
+    if comps > _COMP_LIMIT:
+        msg = (
+            f"[{location}] LIMIT EXCEEDED: {comps}/{_COMP_LIMIT} components — "
+            "view will be rejected by Discord (error 50035)"
+        )
+        print(msg)
+        return msg
+    if text > _TEXT_LIMIT:
+        msg = (
+            f"[{location}] LIMIT EXCEEDED: {text}/{_TEXT_LIMIT} text chars — "
+            "view will be rejected by Discord (error 50035)"
+        )
+        print(msg)
+        return msg
+    return None
+
+
 def _maybe_strip_content(
     is_v2: bool,
     content: str | None,
@@ -179,6 +246,17 @@ def _maybe_strip_content(
     Silently strip it here so callers don't have to remember.
     """
     return None if is_v2 else content
+
+
+def validate_component_text(view) -> int:
+    """
+    Public helper: return the total displayable text character count for
+    a DesignerView.  Call before every send/edit when building dynamic
+    views.  Returns > 4000 means Discord will reject the payload.
+    Mirror of timer.validate_component_text — available here so callers
+    don't need to import timer.py.
+    """
+    return _count_view_text(view)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -454,17 +532,13 @@ async def safe_panel_refresh(
     field collision (error 50035) that occurs whenever a prior edit
     or send included a content string alongside a DesignerView.
 
-    Why content=None is mandatory here:
-      Once a message carries MessageFlags.IS_COMPONENTS_V2, Discord
-      rejects any subsequent edit that includes a content field — even
-      content="" — with error 50035.  There is no way to unset the flag,
-      so every future edit of that message must omit content entirely.
-
-    Fallback hierarchy:
-      edit_original_response(content=None, view=…)
-        └─ fails (stale/rate-limit) → followup.send(view=…, ephemeral=True)
-                                        └─ fails → log_error silently
+    Pre-validates component count (≤40) and text size (≤4000 chars)
+    before sending so Discord never rejects the payload.
     """
+    limit_err = _check_view_limits(new_view, "safe_panel_refresh")
+    if limit_err and not silent:
+        await _log("safe_panel_refresh/pre_send_limit", ValueError(limit_err))
+
     for attempt in range(3):
         try:
             await itx.edit_original_response(content=None, view=new_view)
@@ -587,9 +661,13 @@ async def safe_components_edit(
     Used for in-place view transitions such as login → full panel.
     Always passes content=None (V2 requirement).
 
-    Prefers response.edit_message() for button callbacks (avoids consuming
-    the followup webhook), then falls back to edit_original_response().
+    Pre-validates component count (≤40) and text size (≤4000 chars)
+    before sending so Discord never rejects the payload.
     """
+    limit_err = _check_view_limits(new_view, "safe_components_edit")
+    if limit_err and not silent:
+        await _log("safe_components_edit/pre_send_limit", ValueError(limit_err))
+
     for attempt in range(max_retries + 1):
         try:
             if not _responded(itx):
